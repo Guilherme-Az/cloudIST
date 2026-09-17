@@ -35,4 +35,12 @@ int file_exists(const char *path);
  */
 int absolute_path(const char *path, char *buffer, size_t size);
 
+
+int filter_conf_only(const struct dirent *ficheiro){
+    
+} ;//não sei se isto fica bem aqui mas pronto depois logo vemos
+
+int copy_path_recursive(const char *source_path, const char *vm_path);
+
+int copy_file(const char *source_file, const char *vm_file);
 #endif // FILESYSTEM__H
