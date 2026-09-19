@@ -1,6 +1,7 @@
 #define _XOPEN_SOURCE 700
 
 #include "filesystem.h"
+#include "constants.h"
 
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -10,6 +11,8 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <dirent.h>//tenho de ver se posso usar isto mas acho que sim
+
+
 
 int path_exists(const char *path){
   struct stat st;
@@ -48,12 +51,9 @@ int absolute_path(const char *path, char *buffer, size_t size){
 
 //PERGUNTAR ao stor se posso usar esta função ... e se fica melhor aqui ou na main
 int filter_conf_only(const struct dirent *ficheiro) {
-  if (ficheiro->d_type!= DT_REG) {
-    return 1;
-  }
 
-  int *ficheiro_type = strrchr(ficheiro->d_name, ".");
-  if(ficheiro_type == NULL || strcmp(ficheiro_type, ".conf") != 0){
+  const char *ficheiro_type = strrchr(ficheiro->d_name, '.');
+  if(ficheiro_type == NULL || strcmp(ficheiro_type, ".conf") == 0){
     return 1;
   }
 
@@ -63,7 +63,7 @@ int filter_conf_only(const struct dirent *ficheiro) {
 int copy_path_recursive(const char *source_path, const char *vm_path){
 
   //a função posix para abrir diretorias
-	Dir *dir = opendir(source_path);
+	DIR *dir = opendir(source_path);
 
   if (dir == NULL) {
     perror("opendir error");
@@ -72,7 +72,7 @@ int copy_path_recursive(const char *source_path, const char *vm_path){
   
   struct dirent *entry;
 
-  //se o entre é o ficheir/pasta atual se for null acaba o loop
+  //o entre é o ficheiro/pasta atual se for null acaba o loop
   while ((entry = readdir(dir)) != NULL) {
 
     //isto foi o chat que disse é para não entrar em loops infinitos
@@ -125,7 +125,7 @@ int copy_file(const char *source_file, const char *vm_file) {
 
   //loop basico para ler em chunks do buffer e escrever no ficheiro de destino
   while ((bytes_read = read(fd_source, buffer, sizeof(buffer))) > 0) {
-    write(fd_vm, buffer, bytes_read);
+    write(fd_vm, buffer, (size_t)bytes_read); //adicionei um size_t pq read o devolve um formato ssize_t(numero com sinal) e write recebe o outro que nao tem sinal
   }
 
   close(fd_source);

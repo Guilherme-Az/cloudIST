@@ -2,17 +2,19 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <dirent.h>//é mesmo preciso usar isto perguntei ao stor
+#include <fcntl.h>//é preciso para o open 
 
 #include "parser.h"
 #include "datacenter.h"
 #include "constants.h"
 #include "filesystem.h"//tenho de ver se posso aidiconar isto mas ya PERGUNTAR
+#include "datacenter_utils.h"// para ter a função do find_pending_reservation(tenho de ver se isto é boa arquitetura tho)
 
 int main(int argc, char **argv){
 	DataCenter dc;
 	datacenter_init(&dc);
 
-	if (argc != 5) {// Adding input_dir 
+	if (argc != 6) {// Adding input_dir 
     fprintf(stderr, "Usage: %s <servers> <ram> <disk> <cpus> <input_dir>\n", argv[0]);
     return 1;
   }
@@ -21,16 +23,18 @@ int main(int argc, char **argv){
 	size_t ram;
 	size_t disk;
 	double cpu;
-	char input_dir[MAX_STRING_SIZE];//Adding input_dir
+	char input_dir[MAX_PATH_SIZE];//Adding input_dir
 
 	if (parse_size_t_arg(argv[1], &servers) != 0 ||
 			parse_size_t_arg(argv[2], &ram) != 0 ||
 			parse_size_t_arg(argv[3], &disk) != 0 ||
 			parse_double_arg(argv[4], &cpu) != 0 ||
-			parse_string_arg(argv[5], input_dir, sizeof(input_dir)) != 0) {
+			(argv[5] == NULL || argv[5][0] == '\0')) {//adicionar aqui esta verificação
 		fprintf(stderr, "Invalid command line arguments.\n");
 		return 1;
 	}
+
+
 
 	Resources resources = {
     .ram = ram,
@@ -43,6 +47,12 @@ int main(int argc, char **argv){
 		return 1;
 	}
 
+	//função do stor no filesystem- converte para absulute path
+	if (absolute_path(argv[5], input_dir, MAX_PATH_SIZE) != 0) { // Convert to absolute path and put it in input_dir
+		fprintf(stderr, "Failed to convert path to absolute path.\n");
+		return 1;
+	}
+	printf("absulute path %s\n", input_dir);
 	//Uso uma função auxiliar do stor só para ver se o path existe
 	if (!path_exists(input_dir)) {
 		fprintf(stderr, "Path %s doesn't exist or isn't a directory!\n", input_dir);
@@ -52,31 +62,30 @@ int main(int argc, char **argv){
 	//A blibioteca dirent.h é posix , mas tenho de o stor disse que era para usar isto 
 	struct dirent **conf_file_list;
 
-	/*uso candir que é da dirent.h. input_dir-> path do input. 
+	/*uso scandir que é da dirent.h.(o stor disse para usar) - ele faz um malloc então tenho de fazer free no final
+	*input_dir-> path do input. 
 	*conf_file_list-> output de um array de ficheiros filtrados(separado da diretoria orginal). 
 	*filter_conf_only-> função que filtra e deixa so os ficheiros .conf. 
 	*alphasort-> ordena alfabeticamente*/
-	int n_conf_files = scandir(input_dir, &conf_file_list, filter_conf_only, alphasort); // 
+	int n_conf_files = scandir(input_dir, &conf_file_list, filter_conf_only, alphasort);
+	if (n_conf_files < 0) {
+        fprintf(stderr, "Failed to use scandir.\n");
+        return 1;
+    } 
+	
 
 	//novo loop para ler os ficheiros .conf do conf_file_list
 	for (int i = 0; i < n_conf_files; i++) {
-		char path_buffer[MAX_PATH_SIZE];
-		char absolute_path_buffer[MAX_PATH_SIZE];	
+		char conf_path[MAX_PATH_SIZE +256]; //ele não deixa compilar se não adicionar um bocado 	
 
 		//PERGUNTAR ao stor se posso usar snprintf(acho que sim) é preciso para juntar o conf_file_list de já filtrado ao path do input_dir
-		/*path_buffer->novo buffer para guardar o caminho do ficheiro. 
+		/*conf_path->novo buffer para guardar o caminho do ficheiro. 
 		*max_path_size-> tamanho maximo do path(o linux tem um defenido). 
 		*input_dir-> caminho da diretoria de input(primeiro s). 
-		*conf_file_list[i]->d_name-> nome do ficheiro .
-		*conf filtrado(segundo s)*/ 
-		snprintf(path_buffer, MAX_PATH_SIZE, "%s/%s", input_dir, conf_file_list[i]->d_name); // Prepend input_dir to filename
+		*conf_file_list[i]->d_name-> nome do ficheiro .conf filtrado(segundo s)*/ 
+		snprintf(conf_path, sizeof(conf_path), "%s/%s", input_dir, conf_file_list[i]->d_name); // Prepend input_dir to filename
 
-		if (absolute_path(path_buffer, absolute_path_buffer, MAX_PATH_SIZE) != 0) { // Convert to absolute path
-			fprintf(stderr, "Failed to convert path to absolute path.\n");
-			return 1;
-		}
-
-		int fd = open(absolute_path_buffer, O_RDONLY);
+		int fd = open(conf_path, O_RDONLY);
 
 		if (fd < 0) {
         	perror("open error");
@@ -124,45 +133,40 @@ int main(int argc, char **argv){
 					break;
 				}
 
-				case CMD_EXECUTE:
+				case CMD_EXECUTE:{
 					char id[MAX_STRING_SIZE];
 
-
-					//Copiar atodo o conteundo das diretioria de inputs (comandos D)para o caminho da maquina virtual e chamar recursivamente antes da execução
-					
-					Reservation *reservation = &dc.reservations[0]; //só há uma reseva por conf file
-					//loop pelos items de reserva
-					for (size_t i = 0; i < reservation->items_count; i++){
-						ReservationItem *reservation_item = &reservation->items[i];
-						//loop pelos vms de cada item de reserva 
-						for (size_t j = 0; j < reservation_item->amount; j++) {
-							
-							char *source_input_path = reservation_item->vm_type->input;
-						
-							char vm_input_path[MAX_PATH_SIZE];
-
-							// Construir o caminho de destino para a VM
-							snprintf(vm_input_path, MAX_PATH_SIZE, "/tmp/CloudIST/%s/%s",reservation_item->server_id, vm->id);
-
-					
-							if(copy_path_recursive(source_input_path, vm_input_path) != 0){
-								fprintf(stderr, "Failed to copy input folder for VM %s.\n", vm->id);
-								continue;
-							}
-						}
-
-					}
-
-
-
+					// esta parte era do codigo do stor vou meter antes do meu para ter o id da reserva
 					if(parse_execute(fd, id) != 0){
 						fprintf(stderr, "Invalid execute command. See H (help) for usage.\n");
 						continue;
 					}
 
 					
+					//só há uma reservation por ficheiro conf, então uso esta função do stor
+					Reservation *reservation = find_pending_reservation(&dc, id);
+						if (reservation == NULL) {
+							continue; 
+						}
+					
+					//loop pela lista de vms da reserva
+					for (size_t k = 0; k < reservation->num_vms; k++){
+						VM *vm = reservation->vms[k];
 
-
+						char *source_input_path = vm->type->input_folder;
+						char vm_input_path[MAX_PATH_SIZE];
+						
+						// Construir o caminho de destino para a VM
+						/*"/tmp/CloudIST/%s/%s" -o correto path 
+						*"/home/joana_melol/SO/cloudIST/my_inputs/%s/%s"-para testar*/
+						snprintf(vm_input_path, MAX_PATH_SIZE, "/tmp/CloudIST/%s/%s",id, vm->id); 
+				
+						if(copy_path_recursive(source_input_path, vm_input_path) != 0){
+							fprintf(stderr, "Failed to copy input folder for VM %s.\n", vm->id);
+							continue;
+						}
+					}
+	
 					if (datacenter_execute(&dc, id) != 0) {
 						fprintf(stderr, "Failed to execute reservation.\n");
 						continue;
@@ -171,7 +175,7 @@ int main(int argc, char **argv){
 					printf("Finished reservation execution!\n");
 
 					break;
-
+				}
 				case CMD_LIST:
 					if (datacenter_list(&dc) != 0) {
 						fprintf(stderr, "Failed to list VMs.\n");
@@ -218,5 +222,8 @@ int main(int argc, char **argv){
 
 			
 		}
+		close(fd);
+		free(conf_file_list[i]); //libertar a memoria alocada pelo scandir
 	}
+	free(conf_file_list); //libertar a memoria alocada pelo scandir
 }
