@@ -166,6 +166,7 @@ int main(int argc, char **argv){
 							continue;
 						}
 					}
+					//return 0; //to test if inputs part works
 	
 					if (datacenter_execute(&dc, id) != 0) {
 						fprintf(stderr, "Failed to execute reservation.\n");
