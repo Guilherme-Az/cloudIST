@@ -2,7 +2,9 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <dirent.h>//é mesmo preciso usar isto perguntei ao stor
-#include <fcntl.h>//é preciso para o open 
+#include <fcntl.h>//é preciso para o open
+#include <errno.h>//para o EEXIST do mkdir
+#include <sys/stat.h>//para o mkdir
 
 #include "parser.h"
 #include "datacenter.h"
@@ -50,12 +52,14 @@ int main(int argc, char **argv){
 	//função do stor no filesystem- converte para absulute path
 	if (absolute_path(argv[5], input_dir, MAX_PATH_SIZE) != 0) { // Convert to absolute path and put it in input_dir
 		fprintf(stderr, "Failed to convert path to absolute path.\n");
+		datacenter_destroy(&dc);
 		return 1;
 	}
 	printf("absulute path %s\n", input_dir);
 	//Uso uma função auxiliar do stor só para ver se o path existe
 	if (!path_exists(input_dir)) {
 		fprintf(stderr, "Path %s doesn't exist or isn't a directory!\n", input_dir);
+		datacenter_destroy(&dc);
 		return 1;
 	}
 	
@@ -70,6 +74,7 @@ int main(int argc, char **argv){
 	int n_conf_files = scandir(input_dir, &conf_file_list, filter_conf_only, alphasort);
 	if (n_conf_files < 0) {
         fprintf(stderr, "Failed to use scandir.\n");
+        datacenter_destroy(&dc);
         return 1;
     } 
 	
@@ -80,7 +85,7 @@ int main(int argc, char **argv){
 
 		//PERGUNTAR ao stor se posso usar snprintf(acho que sim) é preciso para juntar o conf_file_list de já filtrado ao path do input_dir
 		/*conf_path->novo buffer para guardar o caminho do ficheiro. 
-		*max_path_size-> tamanho maximo do path(o linux tem um defenido). 
+		*max_path_size-> tamanho maximo do path(o linux tem um definido). 
 		*input_dir-> caminho da diretoria de input(primeiro s). 
 		*conf_file_list[i]->d_name-> nome do ficheiro .conf filtrado(segundo s)*/ 
 		snprintf(conf_path, sizeof(conf_path), "%s/%s", input_dir, conf_file_list[i]->d_name); // Prepend input_dir to filename
@@ -89,10 +94,16 @@ int main(int argc, char **argv){
 
 		if (fd < 0) {
         	perror("open error");
+			//as entradas antes de i já foram libertadas no loop, falta a atual e as seguintes
+			for (int j = i; j < n_conf_files; j++) {
+				free(conf_file_list[j]);
+			}
+			free(conf_file_list);
+			datacenter_destroy(&dc);
         	return 1;
     	}
-
-		while(1) {
+		int done = 0;
+		while(!done){ 
 			
 			switch (get_next_command(fd)){
 				case CMD_DEFINE: {
@@ -116,7 +127,7 @@ int main(int argc, char **argv){
 				case CMD_RESERVE: {
 					Reservation reservation = {0};
 
-					size_t num_items = parse_reserve(STDIN_FILENO, &reservation, MAX_RESERVATIONS_ITEMS);
+					size_t num_items = parse_reserve(fd, &reservation, MAX_RESERVATIONS_ITEMS);
 
 					if (num_items == 0) {
 						fprintf(stderr, "Invalid reserve command. See H (help) for usage.\n");
@@ -149,6 +160,9 @@ int main(int argc, char **argv){
 							continue; 
 						}
 					
+					//se alguma copia falhar não pode executar (o enunciado diz para copiar antes de executar)
+					int copy_failed = 0;
+
 					//loop pela lista de vms da reserva
 					for (size_t k = 0; k < reservation->num_vms; k++){
 						VM *vm = reservation->vms[k];
@@ -160,14 +174,35 @@ int main(int argc, char **argv){
 						/*"/tmp/CloudIST/%s/%s" -o correto path 
 						*"/home/joana_melol/SO/cloudIST/my_inputs/%s/%s"-para testar*/
 						snprintf(vm_input_path, MAX_PATH_SIZE, "/tmp/CloudIST/%s/%s",id, vm->id); 
-				
+						//PERGUNTAR ao stor se é preciso criar isto ou se já existe
+						/*o mkdir só cria o ultimo nivel do caminho, por isso cria-se um de cada vez:
+						 /tmp/CloudIST -> /tmp/CloudIST/<reserva> -> /tmp/CloudIST/<reserva>/<vm>
+						/EEXIST = a pasta já existe, isso não é erro*/
+						char reservation_path[MAX_PATH_SIZE];
+						snprintf(reservation_path, MAX_PATH_SIZE, "/tmp/CloudIST/%s", id);
+
+						if ((mkdir("/tmp/CloudIST", 0777) != 0 && errno != EEXIST) ||
+								(mkdir(reservation_path, 0777) != 0 && errno != EEXIST) ||
+								(mkdir(vm_input_path, 0777) != 0 && errno != EEXIST)) {
+							perror("mkdir error");
+							copy_failed = 1;
+							break;
+						}
+
 						if(copy_path_recursive(source_input_path, vm_input_path) != 0){
 							fprintf(stderr, "Failed to copy input folder for VM %s.\n", vm->id);
-							continue;
+							copy_failed = 1;
+							break;
 						}
 					}
 					//return 0; //to test if inputs part works
-	
+
+					//o break só sai do for, por isso verifica-se aqui se a copia falhou para não executar
+					if (copy_failed) {
+						fprintf(stderr, "Reservation %s not executed because its inputs could not be copied.\n", id);
+						continue;
+					}
+
 					if (datacenter_execute(&dc, id) != 0) {
 						fprintf(stderr, "Failed to execute reservation.\n");
 						continue;
@@ -188,7 +223,7 @@ int main(int argc, char **argv){
 				case CMD_WAIT:
 					unsigned int delay;
 
-					if(parse_wait(STDIN_FILENO, &delay) != 0){
+					if(parse_wait(fd, &delay) != 0){
 						fprintf(stderr, "Invalid wait command. See H (help) for usage.\n");
 						continue;
 					}
@@ -217,8 +252,8 @@ int main(int argc, char **argv){
 					break;
 
 				case EOC:
-					datacenter_destroy(&dc);
-					return 0;
+					done=1;
+					break;
 			}
 
 			
@@ -226,5 +261,7 @@ int main(int argc, char **argv){
 		close(fd);
 		free(conf_file_list[i]); //libertar a memoria alocada pelo scandir
 	}
-	free(conf_file_list); //libertar a memoria alocada pelo scandir
+	datacenter_destroy(&dc);
+	free(conf_file_list);
+	return 0; //libertar a memoria alocada pelo scandir
 }
