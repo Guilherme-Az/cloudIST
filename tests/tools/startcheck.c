@@ -119,6 +119,39 @@ int execvp(const char *file, char *const argv[]) {
   return real(file, argv);
 }
 
+/* execl/execlp are variadic: collect the arguments and call the real execv/execvp. */
+#define MAX_EXEC_ARGS 64
+static void collect_args(const char *arg0, va_list ap, char **argv) {
+  int i = 0;
+  argv[i++] = (char *)arg0;
+  while (i < MAX_EXEC_ARGS - 1 && (argv[i] = va_arg(ap, char *)) != NULL) i++;
+  argv[i] = NULL;
+}
+
+int execl(const char *path, const char *arg0, ...) {
+  static int (*real)(const char *, char *const[]);
+  if (!real) real = dlsym(RTLD_NEXT, "execv");
+  char *argv[MAX_EXEC_ARGS];
+  va_list ap;
+  va_start(ap, arg0);
+  collect_args(arg0, ap, argv);
+  va_end(ap);
+  snapshot("execl");
+  return real(path, argv);
+}
+
+int execlp(const char *file, const char *arg0, ...) {
+  static int (*real)(const char *, char *const[]);
+  if (!real) real = dlsym(RTLD_NEXT, "execvp");
+  char *argv[MAX_EXEC_ARGS];
+  va_list ap;
+  va_start(ap, arg0);
+  collect_args(arg0, ap, argv);
+  va_end(ap);
+  snapshot("execlp");
+  return real(file, argv);
+}
+
 __attribute__((destructor)) static void report_open_fds(void) {
   int fd = open_log();
   if (fd < 0) return;

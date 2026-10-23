@@ -90,7 +90,8 @@ int main(int argc, char **argv){
 		*conf_file_list[i]->d_name-> nome do ficheiro .conf filtrado(segundo s)*/ 
 		snprintf(conf_path, sizeof(conf_path), "%s/%s", input_dir, conf_file_list[i]->d_name); // Prepend input_dir to filename
 
-		int fd = open(conf_path, O_RDONLY);
+		//abrir o ficheiro .conf para ler e para fechar automaticamente quando o processo filho for criado (O_CLOEXEC)
+		int fd = open(conf_path, O_RDONLY | O_CLOEXEC);
 
 		if (fd < 0) {
         	perror("open error");

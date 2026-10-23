@@ -239,20 +239,55 @@ void reservation_destroy(DataCenter *dc, Reservation *reservation) {
 }
 
 void spawn_vm_child(VM *vm) {
-	(void)vm; // To avoid warning.
 
-	// TODO: Limit RAM, DISK and use exec with cpulimit.
+	struct rlimit mem, disk;
 
-	fprintf(stderr, "VM execution not implemented in base version.\n");
+	//multiplica a ram da vm que está em GB por 2^30 para converter para bytes, e converte para o tipo rlim_t que é o tipo que a struct rlimit espera
+	mem.rlim_cur = (rlim_t)vm->type->required.ram << 30;
+	mem.rlim_max = mem.rlim_cur;
+
+	disk.rlim_cur = (rlim_t)vm->type->required.disk << 30;
+	disk.rlim_max = disk.rlim_cur;
+
+	if (setrlimit(RLIMIT_AS, &mem) == -1) {
+		perror("setrlimit mem");
+		_exit(1); //sem limit de memoria nao arranca a vm
+	}
+	if (setrlimit(RLIMIT_FSIZE, &disk) == -1) {
+		perror("setrlimit disk");
+		_exit(1); //sem limit de tamanho de ficheiro nao arranca a vm
+	}
+
+	//corre o exec_path do vm
+	execl(vm->type->exec_path, vm->type->exec_path, (char *)NULL); 
+	perror("exec"); 
+	_exit(1);
+
 }
 
 int spawn_all_vms(Reservation *res) {
+	pid_t child_pid;
+
+	
+	//loop por cada vm da reserva e cria um child process para cada uma
 	for (size_t i = 0; i < res->num_vms; i++) {
 		VM *vm = res->vms[i];
-
-		// TODO: Implement fork code. Set VM PID and update VM state to running.
-
-		spawn_vm_child(vm);
+		fflush(stdout);//não é necessário agora, mas básicamente garante que o que está no buffer de stdout é escrito antes de criar o child process, porque o child process herda o buffer do pai e se não se fizer flush, o que estava no buffer do pai vai ser escrito pelo child process também, duplicando a escrita
+		//fork: -1 erro, 0 child, default >= parent process (pid do child),
+		switch(child_pid = fork()){
+			case -1:
+				perror("fork error");
+				return 1;
+			//child process, chama a função para executar a vm
+			case 0:
+				spawn_vm_child(vm);
+				_exit(1); //usar o _exit em vez de exit porque o exit limpa tudo e flushes buffers  enquanto o _exit apenas sai do processo sem limpar, que é o que queres de um child process
+			//só o pai é que continua a correr o loop para criar outras children
+			default:
+				vm->pid = child_pid;
+				vm->state = VM_STATE_RUNNING;
+				break;
+		}
 
 	}
 

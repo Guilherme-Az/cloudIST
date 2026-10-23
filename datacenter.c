@@ -125,12 +125,6 @@ int datacenter_execute(DataCenter *dc, const char *reservation_id) {
 
   res->state = RES_STATE_RUNNING;
 
-  wait_for_all_vms(res);
-
-  res->state = RES_STATE_FINISHED;
-
-  reservation_destroy(dc, res);
-
   return 0;
 }
 

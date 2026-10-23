@@ -184,17 +184,39 @@ listing() {   # type size path, dirs have size 0
                  find . -mindepth 1 -type l -printf 'l 0 %P\n'; } ) | LC_ALL=C sort
 }
 
-# snapshot_of <name> <res> <vm>: subtree of <res>/<vm> in the first start snapshot where <res>/ exists
-snapshot_of() {
-  awk -v res="$2" -v p="$2/$3/" '
-    /^SNAPSHOT/    { inside=1; buf=""; has=0; next }
-    /^ENDSNAPSHOT/ { if (has && !done) { printf "%s", buf; done=1 } inside=0; next }
+# snapshots_of <name> <res> <vm>: for every app-start snapshot (exec or the base-code
+# stub message; fork is ignored because from exercise 2 on the copy happens in the
+# child, after the fork) in which <res>/<vm> exists, print that VM's subtree, sorted,
+# followed by a line "@@END".
+snapshots_of() {
+  awk -v vmdir="$2/$3" -v p="$2/$3/" '
+    /^SNAPSHOT/    { inside = ($2 != "fork"); n=0; has=0; next }
+    /^ENDSNAPSHOT/ {
+      if (inside && has) { cmd = "LC_ALL=C sort"; for (i = 0; i < n; i++) print buf[i] | cmd; close(cmd); print "@@END" }
+      inside=0; next
+    }
     inside {
       t=$1; s=$2; rest=substr($0, length($1) + length($2) + 3)
-      if (rest == res) has=1
-      if (index(rest, p) == 1) buf = buf t " " s " " substr(rest, length(p) + 1) "\n"
-    }
-    END { if (!done) print "NO_SNAPSHOT" }' "$OUT/$1.log" | LC_ALL=C sort
+      if (rest == vmdir) has=1
+      if (index(rest, p) == 1) buf[n++] = t " " s " " substr(rest, length(p) + 1)
+    }' "$OUT/$1.log"
+}
+
+# snapshot_verdict <name> <res> <vm> <src>: COMPLETE | INCOMPLETE | MISSING | NOSTART
+snapshot_verdict() {
+  grep -qE '^SNAPSHOT (exec|stub)' "$OUT/$1.log" || { echo NOSTART; return; }
+  local expected current="" any=0 line
+  expected=$(listing "$4")
+  while IFS= read -r line; do
+    if [ "$line" = "@@END" ]; then
+      any=1
+      [ "$current" = "$expected" ] && { echo COMPLETE; return; }
+      current=""
+    else
+      current+="${current:+$'\n'}$line"
+    fi
+  done < <(snapshots_of "$1" "$2" "$3")
+  if [ $any -eq 1 ]; then echo INCOMPLETE; else echo MISSING; fi
 }
 
 # check_copy <name> <res> <vm> <src>
@@ -209,15 +231,11 @@ check_copy() {
     fail "diff -r ${src#"$ROOT"/} $dst differs:"
     while IFS= read -r line; do REASONS+=("    $line"); done < <(head -8 <<< "$d")
   fi
-  local snap
-  snap=$(snapshot_of "$name" "$res" "$vm")
-  if ! grep -q '^SNAPSHOT' "$OUT/$name.log"; then
-    fail "application for $res was never started (no start event seen)"
-  elif [ "$snap" = "NO_SNAPSHOT" ]; then
-    fail "$dst did not exist yet when the application started"
-  elif [ "$snap" != "$(listing "$src")" ]; then
-    fail "copy for $vm was INCOMPLETE when the application started"
-  fi
+  case "$(snapshot_verdict "$name" "$res" "$vm" "$src")" in
+    NOSTART)    fail "application for $res was never started (no exec / start event seen)" ;;
+    MISSING)    fail "$dst did not exist yet when the application started" ;;
+    INCOMPLETE) fail "copy for $vm was INCOMPLETE when the application started" ;;
+  esac
 }
 
 check_stderr_absent() {  # <name> <pattern> <message>
