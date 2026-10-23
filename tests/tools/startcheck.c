@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -56,6 +57,9 @@ static int snap_cb(const char *fpath, const struct stat *sb, int flag, struct FT
 static void snapshot(const char *why) {
   log_fd = open_log();
   if (log_fd < 0) return;
+  /* Several VM children can take a snapshot at the same time: lock the log so
+   * their lines don't get mixed. The lock is released by close(). */
+  flock(log_fd, LOCK_EX);
   dprintf(log_fd, "SNAPSHOT %s\n", why);
   nftw(CLOUD_ROOT, snap_cb, 16, FTW_PHYS);
   dprintf(log_fd, "ENDSNAPSHOT\n");

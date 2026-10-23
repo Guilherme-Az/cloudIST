@@ -225,3 +225,37 @@ int delete_path_recursive(const char *vm_path){
 
 	return 0;
 }
+
+int make_vm_folder_path(const char *input_folder, const char *reservation_id, const char *vm_id) {
+  char vm_input_path[MAX_PATH_SIZE];
+
+  // Construir o caminho de destino para a VM
+  /*"/tmp/CloudIST/%s/%s" -o correto path
+  *"/home/joana_melol/SO/cloudIST/my_inputs/%s/%s"-para testar*/
+  snprintf(vm_input_path, MAX_PATH_SIZE, "/tmp/CloudIST/%s/%s", reservation_id, vm_id);
+  //PERGUNTAR ao stor se é preciso criar isto ou se já existe
+  /*o mkdir só cria o ultimo nivel do caminho, por isso cria-se um de cada vez:
+    /tmp/CloudIST -> /tmp/CloudIST/<reserva> -> /tmp/CloudIST/<reserva>/<vm>
+  /EEXIST = a pasta já existe, isso não é erro*/
+  char reservation_path[MAX_PATH_SIZE];
+  snprintf(reservation_path, MAX_PATH_SIZE, "/tmp/CloudIST/%s", reservation_id);
+
+  if ((mkdir("/tmp/CloudIST", 0777) != 0 && errno != EEXIST) ||
+      (mkdir(reservation_path, 0777) != 0 && errno != EEXIST) ||
+      (mkdir(vm_input_path, 0777) != 0 && errno != EEXIST)) {
+    perror("mkdir error");
+    return 1;
+  }
+
+  //o stor dise que se já existisse a pasta para apagar recurvsvamente antes de fazer a copia
+  if (delete_path_recursive(vm_input_path) != 0) {
+    fprintf(stderr, "Failed to delete existing input folder for VM %s.\n", vm_id);
+    return 1;
+  }
+  if(copy_path_recursive(input_folder, vm_input_path) != 0){
+    fprintf(stderr, "Failed to copy input folder for VM %s.\n", vm_id);
+    return 1;
+  }
+
+  return 0;
+}

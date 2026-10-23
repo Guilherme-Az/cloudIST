@@ -154,61 +154,6 @@ int main(int argc, char **argv){
 						continue;
 					}
 
-					
-					//só há uma reservation por ficheiro conf, então uso esta função do stor
-					Reservation *reservation = find_pending_reservation(&dc, id);
-						if (reservation == NULL) {
-							continue; 
-						}
-					
-					//se alguma copia falhar não pode executar (o enunciado diz para copiar antes de executar)
-					int copy_failed = 0;
-
-					//loop pela lista de vms da reserva
-					for (size_t k = 0; k < reservation->num_vms; k++){
-						VM *vm = reservation->vms[k];
-
-						char *source_input_path = vm->type->input_folder;
-						char vm_input_path[MAX_PATH_SIZE];
-						
-						// Construir o caminho de destino para a VM
-						/*"/tmp/CloudIST/%s/%s" -o correto path 
-						*"/home/joana_melol/SO/cloudIST/my_inputs/%s/%s"-para testar*/
-						snprintf(vm_input_path, MAX_PATH_SIZE, "/tmp/CloudIST/%s/%s",id, vm->id); 
-						//PERGUNTAR ao stor se é preciso criar isto ou se já existe
-						/*o mkdir só cria o ultimo nivel do caminho, por isso cria-se um de cada vez:
-						 /tmp/CloudIST -> /tmp/CloudIST/<reserva> -> /tmp/CloudIST/<reserva>/<vm>
-						/EEXIST = a pasta já existe, isso não é erro*/
-						char reservation_path[MAX_PATH_SIZE];
-						snprintf(reservation_path, MAX_PATH_SIZE, "/tmp/CloudIST/%s", id);
-
-						if ((mkdir("/tmp/CloudIST", 0777) != 0 && errno != EEXIST) ||
-								(mkdir(reservation_path, 0777) != 0 && errno != EEXIST) ||
-								(mkdir(vm_input_path, 0777) != 0 && errno != EEXIST)) {
-							perror("mkdir error");
-							copy_failed = 1;
-							break;
-						}
-
-						//o stor dise que se já existisse a pasta para apagar recurvsvamente antes de fazer a copia
-						if (delete_path_recursive(vm_input_path) != 0) {
-							fprintf(stderr, "Failed to delete existing input folder for VM %s.\n", vm->id);
-							copy_failed = 1;
-							break;
-						}
-						if(copy_path_recursive(source_input_path, vm_input_path) != 0){
-							fprintf(stderr, "Failed to copy input folder for VM %s.\n", vm->id);
-							copy_failed = 1;
-							break;
-						}
-					}
-					//return 0; //to test if inputs part works
-
-					//o break só sai do for, por isso verifica-se aqui se a copia falhou para não executar
-					if (copy_failed) {
-						fprintf(stderr, "Reservation %s not executed because its inputs could not be copied.\n", id);
-						continue;
-					}
 
 					if (datacenter_execute(&dc, id) != 0) {
 						fprintf(stderr, "Failed to execute reservation.\n");

@@ -238,7 +238,14 @@ void reservation_destroy(DataCenter *dc, Reservation *reservation) {
 	dc->num_reservations--;
 }
 
-void spawn_vm_child(VM *vm) {
+void spawn_vm_child(VM *vm, const char *reservation_id) {
+
+	//prepara a pasta da vm (criar, limpar, copiar inputs) antes dos limites, para a copia não ficar limitada
+	//se falhar, o filho sai sem correr a app (a vm acaba logo e é destruida como as outras)
+	if (make_vm_folder_path(vm->type->input_folder, reservation_id, vm->id) != 0) {
+		fprintf(stderr, "Failed to prepare input folder for VM %s.\n", vm->id);
+		_exit(1);
+	}
 
 	struct rlimit mem, disk;
 
@@ -268,7 +275,6 @@ void spawn_vm_child(VM *vm) {
 int spawn_all_vms(Reservation *res) {
 	pid_t child_pid;
 
-	
 	//loop por cada vm da reserva e cria um child process para cada uma
 	for (size_t i = 0; i < res->num_vms; i++) {
 		VM *vm = res->vms[i];
@@ -280,7 +286,7 @@ int spawn_all_vms(Reservation *res) {
 				return 1;
 			//child process, chama a função para executar a vm
 			case 0:
-				spawn_vm_child(vm);
+				spawn_vm_child(vm, res->id);
 				_exit(1); //usar o _exit em vez de exit porque o exit limpa tudo e flushes buffers  enquanto o _exit apenas sai do processo sem limpar, que é o que queres de um child process
 			//só o pai é que continua a correr o loop para criar outras children
 			default:

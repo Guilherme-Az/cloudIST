@@ -44,4 +44,7 @@ int copy_path_recursive(const char *source_path, const char *vm_path);
 int copy_file(const char *source_file, const char *vm_file);
 
 int delete_path_recursive(const char *vm_path);
+
+//cria /tmp/CloudIST/<reserva>/<vm> (se não existir), apaga o conteúdo antigo e copia os inputs para lá. 0 = ok, 1 = erro
+int make_vm_folder_path(const char *input_folder, const char *reservation_id, const char *vm_id);
 #endif // FILESYSTEM__H
