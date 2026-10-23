@@ -42,4 +42,6 @@ int filter_conf_only(const struct dirent *ficheiro);//não sei se isto fica bem 
 int copy_path_recursive(const char *source_path, const char *vm_path);
 
 int copy_file(const char *source_file, const char *vm_file);
+
+int delete_path_recursive(const char *vm_path);
 #endif // FILESYSTEM__H

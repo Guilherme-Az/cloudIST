@@ -164,3 +164,64 @@ int copy_file(const char *source_file, const char *vm_file) {
 
   return 0;
 }
+
+int delete_path_recursive(const char *vm_path){
+
+  //a função posix para abrir diretorias
+	DIR *dir = opendir(vm_path);
+
+  if (dir == NULL) {
+    perror("opendir error");
+    return 1;
+  }
+  
+  struct dirent *entry;
+
+  //o entre é o ficheiro/pasta atual se for null acaba o loop
+  while ((entry = readdir(dir)) != NULL) {
+
+    //isto foi o chat que disse é para não entrar em loops infinitos
+    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+      continue;
+    }
+
+    char vm_entry_path[MAX_PATH_SIZE];
+
+    //copiar o caminho todo tipo pronto se houver pastas dentro de pastas
+    snprintf(vm_entry_path, MAX_PATH_SIZE, "%s/%s", vm_path, entry->d_name);
+
+    //tenho de usar lstat para apagar symlinks(atalhos). As funções path_exists e file_exists usam stat
+    struct stat st;
+    if (lstat(vm_entry_path, &st) != 0) {
+      perror("lstat error");
+      closedir(dir);
+      return 1;
+    }
+    
+
+    if (S_ISDIR(st.st_mode)) {
+      //entrar na parte recursiva para as pastas dentro de pastas e depois remover a diretoria (se já existir)
+      
+      if (delete_path_recursive(vm_entry_path) != 0) {
+        closedir(dir);
+        return 1;
+      }
+
+      if (rmdir(vm_entry_path) != 0) {
+        perror("rmdir error");
+        closedir(dir);
+        return 1;
+      }
+    //se chegarmos a um ficheiro ou symlinks(atalho) faz unlink
+    } else {
+      if (unlink(vm_entry_path) != 0) {
+        perror("unlink error");
+        closedir(dir);
+        return 1;
+      }
+    }
+  }
+  closedir(dir);
+
+	return 0;
+}

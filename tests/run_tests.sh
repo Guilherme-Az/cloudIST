@@ -227,11 +227,13 @@ check_stderr_absent() {  # <name> <pattern> <message>
 # copy_case <name> <conf_dir> "<res> <vm> <input>"... [--hook fn]
 copy_case() {
   local name=$1 dir=$2; shift 2
-  local hook=""
+  local hook="" post=""
   if [ "${1:-}" = --hook ]; then hook=$2; shift 2; fi
+  if [ "${1:-}" = --post ]; then post=$2; shift 2; fi
   rm -rf "$CLOUD"; [ -n "$hook" ] && $hook
   run_prog "$name" "$dir"
   check_exit "$name" zero
+  [ -n "$post" ] && $post
   local spec
   for spec in "$@"; do
     # shellcheck disable=SC2086
@@ -294,8 +296,26 @@ copy_case 05_binary        "$C/05_binary"       "T05 T05_1 binary"
 copy_case 06_large         "$C/06_large"        "T06 T06_1 large"
 copy_case 07_spaces        "$C/07_spaces"       "T07 T07_1 spaces"
 
-pre_08() { mkdir -p "$CLOUD/T08/T08_1/sub"; printf 'THIS OLD CONTENT IS MUCH LONGER THAN THE NEW ONE\n' > "$CLOUD/T08/T08_1/a.txt"; }
-copy_case 08_dest_exists   "$C/08_dest_exists"  --hook pre_08 "T08 T08_1 dest_exists"
+# The VM folder already exists with old content. Everything in it must be deleted
+# (recursively) before copying, so diff -r must show NO leftovers. A symlink to a
+# folder OUTSIDE the VM must be removed as a link only: its target must survive.
+pre_08() {
+  local vm="$CLOUD/T08/T08_1"
+  mkdir -p "$vm/sub" "$vm/velha/x/z"
+  printf 'THIS OLD CONTENT IS MUCH LONGER THAN THE NEW ONE\n' > "$vm/a.txt"
+  printf 'old\n' > "$vm/antigo.txt"
+  printf 'old\n' > "$vm/sub/antigo_sub.txt"
+  printf 'old\n' > "$vm/velha/x/y.txt"
+  rm -rf "$OUT/08_outside"; mkdir -p "$OUT/08_outside"
+  printf 'must survive\n' > "$OUT/08_outside/keep.txt"
+  ln -s "$OUT/08_outside" "$vm/link_to_outside"
+  ln -s /does/not/exist "$vm/broken_link"
+}
+post_08() {
+  [ -f "$OUT/08_outside/keep.txt" ] \
+    || fail "the cleanup followed the symlink link_to_outside and deleted files OUTSIDE the VM folder (use lstat, not stat)"
+}
+copy_case 08_dest_exists   "$C/08_dest_exists"  --hook pre_08 --post post_08 "T08 T08_1 dest_exists"
 
 copy_case 09_multi_conf    "$C/09_multi_conf"   "T09A T09A_1 flat" "T09B T09B_1 nested" "T09C T09C_1 spaces"
 

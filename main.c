@@ -189,6 +189,12 @@ int main(int argc, char **argv){
 							break;
 						}
 
+						//o stor dise que se já existisse a pasta para apagar recurvsvamente antes de fazer a copia
+						if (delete_path_recursive(vm_input_path) != 0) {
+							fprintf(stderr, "Failed to delete existing input folder for VM %s.\n", vm->id);
+							copy_failed = 1;
+							break;
+						}
 						if(copy_path_recursive(source_input_path, vm_input_path) != 0){
 							fprintf(stderr, "Failed to copy input folder for VM %s.\n", vm->id);
 							copy_failed = 1;
