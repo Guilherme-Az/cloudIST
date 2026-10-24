@@ -238,7 +238,7 @@ void reservation_destroy(DataCenter *dc, Reservation *reservation) {
 	dc->num_reservations--;
 }
 
-void spawn_vm_child(VM *vm, const char *reservation_id) {
+void spawn_vm_child(VM *vm, const char *reservation_id, double cpu_percentage) {
 
 	//prepara a pasta da vm (criar, limpar, copiar inputs) antes dos limites, para a copia não ficar limitada
 	//se falhar, o filho sai sem correr a app (a vm acaba logo e é destruida como as outras)
@@ -267,19 +267,35 @@ void spawn_vm_child(VM *vm, const char *reservation_id) {
 		_exit(1); //sem limit de tamanho de ficheiro nao arranca a vm
 	}
 
-	//corre o exec_path do vm
-	execl(vm->type->exec_path, vm->type->exec_path, (char *)NULL); 
-	perror("exec"); 
+	//o cpulimit -l só aceita inteiros: truncar (8.33 -> 8) e no minimo 1 (VMs muito pequenas davam 0)
+	int cpu_limit = (int)cpu_percentage;
+	if (cpu_limit < 1) {
+		cpu_limit = 1;
+	}
+	//o exec só recebe strings, por isso converte-se o numero para texto
+	char cpu_limit_str[32];
+	snprintf(cpu_limit_str, sizeof(cpu_limit_str), "%d", cpu_limit);
+
+	//corre o exec_path do vm através do cpulimit (enunciado: cpulimit -q -f -l <CPULIMIT> -- <EXEC_PATH>)
+	//execlp com p porque procura o cpulimit no PATH; a app vai depois do --
+	execlp("cpulimit", "cpulimit", "-q", "-f", "-l", cpu_limit_str, "--", vm->type->exec_path, (char *)NULL);
+	perror("exec cpulimit");
 	_exit(1);
 
 }
 
-int spawn_all_vms(Reservation *res) {
+int spawn_all_vms(DataCenter *dc, Reservation *res) {
 	pid_t child_pid;
 
 	//loop por cada vm da reserva e cria um child process para cada uma
 	for (size_t i = 0; i < res->num_vms; i++) {
 		VM *vm = res->vms[i];
+
+		//% de cpu para o cpulimit de cada processo child
+		//100 * vCPUs da vm * cores locais / (CPUs por servidor * nº de servidores)
+		double cpu_percentage = 100.0 * vm->type->required.cpu * (double)dc->local_cores
+		                        / (vm->server->total.cpu * (double)dc->num_servers);
+
 		fflush(stdout);//não é necessário agora, mas básicamente garante que o que está no buffer de stdout é escrito antes de criar o child process, porque o child process herda o buffer do pai e se não se fizer flush, o que estava no buffer do pai vai ser escrito pelo child process também, duplicando a escrita
 		//fork: -1 erro, 0 child, default >= parent process (pid do child),
 		switch(child_pid = fork()){
@@ -288,7 +304,7 @@ int spawn_all_vms(Reservation *res) {
 				return 1;
 			//child process, chama a função para executar a vm
 			case 0:
-				spawn_vm_child(vm, res->id);
+				spawn_vm_child(vm, res->id, cpu_percentage);
 				_exit(1); //usar o _exit em vez de exit porque o exit limpa tudo e flushes buffers  enquanto o _exit apenas sai do processo sem limpar, que é o que queres de um child process
 			//só o pai é que continua a correr o loop para criar outras children
 			default:

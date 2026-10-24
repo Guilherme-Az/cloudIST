@@ -22,6 +22,9 @@ IN="$T/inputs"
 CLOUD=/tmp/CloudIST
 BIN="$ROOT/cloudIST"
 ARGS=(2 64 1000 16)          # SERVERS RAM DISK CPU
+LOCAL_CORES=4                # only used if the program expects it (see detect_cli)
+MAX_THREADS=2                # idem
+TAIL=()
 TIMEOUT=30
 
 cd "$ROOT" || exit 1
@@ -119,7 +122,7 @@ run_prog() {
   local name=$1 dir=$2
   rm -f "$OUT/$name".*
   CLOUDIST_TEST_LOG="$OUT/$name.log" LD_PRELOAD="$OUT/startcheck.so" \
-    timeout "$TIMEOUT" "$BIN" "${ARGS[@]}" "$dir" < /dev/null \
+    timeout "$TIMEOUT" "$BIN" "${ARGS[@]}" "$dir" "${TAIL[@]}" < /dev/null \
     > "$OUT/$name.stdout" 2> "$OUT/$name.stderr"
   RC=$?
   echo "$RC" > "$OUT/$name.rc"
@@ -132,7 +135,7 @@ memcheck() {
   rm -rf "$CLOUD"; [ -n "$hook" ] && $hook
   if [ "$MEMCHECK" = valgrind ]; then
     timeout $((TIMEOUT * 10)) valgrind --leak-check=full --track-fds=yes --show-leak-kinds=all \
-      --log-file="$OUT/$name.valgrind" "$BIN" "${ARGS[@]}" "$dir" < /dev/null > /dev/null 2>&1
+      --log-file="$OUT/$name.valgrind" "$BIN" "${ARGS[@]}" "$dir" "${TAIL[@]}" < /dev/null > /dev/null 2>&1
     local lost
     lost=$(grep -E "definitely lost:|indirectly lost:|still reachable:" "$OUT/$name.valgrind" \
            | grep -v " 0 bytes" | sed 's/^==[0-9]*== *//' | paste -sd ';' -)
@@ -148,7 +151,7 @@ memcheck() {
       && fail "valgrind: memory errors (see tests/out/$name.valgrind)"
   else
     ASAN_OPTIONS=detect_leaks=1:log_path="$OUT/$name.asan" UBSAN_OPTIONS=print_stacktrace=1 \
-      timeout $((TIMEOUT * 3)) "$OUT/cloudIST_asan" "${ARGS[@]}" "$dir" < /dev/null > /dev/null 2>&1
+      timeout $((TIMEOUT * 3)) "$OUT/cloudIST_asan" "${ARGS[@]}" "$dir" "${TAIL[@]}" < /dev/null > /dev/null 2>&1
     local f
     for f in "$OUT/$name".asan*; do
       [ -e "$f" ] || continue
@@ -263,10 +266,26 @@ copy_case() {
   report "$name"
 }
 
+# The command line changes between exercises:
+#   Ex1: <SERVERS> <RAM> <DISK> <CPU> <INPUT_DIR>
+#   Ex2: <SERVERS> <RAM> <DISK> <CPU> <LOCAL_CORES> <INPUT_DIR>        (teacher's FAQ)
+#   Ex3: <SERVERS> <RAM> <DISK> <CPU> <LOCAL_CORES> <INPUT_DIR> <MAX_THREADS>
+# Count the <...> in the program's Usage message to know which one it expects.
+detect_cli() {
+  local n
+  n=$("$BIN" 2>&1 | grep -m1 -i usage | grep -o '<[^>]*>' | wc -l)
+  TAIL=()
+  [ "$n" -ge 6 ] && ARGS+=("$LOCAL_CORES")
+  [ "$n" -ge 7 ] && TAIL=("$MAX_THREADS")
+  echo "command line: cloudIST ${ARGS[*]} <INPUT_DIR> ${TAIL[*]}  (Usage shows $n arguments)"
+  echo
+}
+
 # ------------------------------------------------------------------ main ---
 
 mkdir -p "$OUT"
 build
+detect_cli
 gen_inputs
 
 echo "== Static checks"

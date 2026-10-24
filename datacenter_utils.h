@@ -91,19 +91,22 @@ void destroy_vm_by_pid(DataCenter *dc, pid_t pid);
  *
  * @param vm Pointer to the VM being spawned.
  * @param reservation_id Id of the VM's reservation (for the folder path).
+ * @param cpu_percentage CPU limit for cpulimit -l (may be above 100).
  */
-void spawn_vm_child(VM *vm, const char *reservation_id);
+void spawn_vm_child(VM *vm, const char *reservation_id, double cpu_percentage);
 
 /**
  * Forks one child per VM in the reservation, calling spawn_vm_child()
  * in each child and recording the pid/state in the parent.
  *
+ * @param dc Pointer to the Data Center (number of servers and local cores,
+ *           for the cpulimit percentage).
  * @param res Pointer to the Reservation whose VMs should be spawned.
  *
  * @return 0 on success.
  * @return 1 if any fork() call fails.
  */
-int spawn_all_vms(Reservation *res);
+int spawn_all_vms(DataCenter *dc, Reservation *res);
 
 /**
  * Blocks until every VM's process has exited, updating each VM's state

@@ -22,6 +22,9 @@ OUT="$T/out/ex2"
 CLOUD=/tmp/CloudIST
 BIN="$ROOT/cloudIST"
 ARGS=(2 64 1000 16)          # SERVERS RAM DISK CPU  (VMs in the cases: 1 GB RAM, 1 GB disk, 8 vCPU)
+LOCAL_CORES=4                # only used if the program expects it (see detect_cli)
+MAX_THREADS=2                # idem
+TAIL=()
 TIMEOUT=30
 
 cd "$ROOT" || exit 1
@@ -86,7 +89,7 @@ run_case() {
   local start end
   start=$(date +%s%N)
   RESULT_DIR="$OUT/$c/results" CLOUDIST_TEST_LOG="$OUT/$c/startcheck.log" LD_PRELOAD="$OUT/startcheck.so" \
-    timeout "$TIMEOUT" "$bin" "${ARGS[@]}" "$OUT/$c/confs" < /dev/null > "$OUT/$c/stdout" 2> "$OUT/$c/stderr"
+    timeout "$TIMEOUT" "$bin" "${ARGS[@]}" "$OUT/$c/confs" "${TAIL[@]}" < /dev/null > "$OUT/$c/stdout" 2> "$OUT/$c/stderr"
   RC=$?
   end=$(date +%s%N)
   ELAPSED=$(awk -v s="$start" -v e="$end" 'BEGIN { printf "%.2f", (e - s) / 1e9 }')
@@ -135,9 +138,25 @@ section() {   # section <case> <name> -> lines of the inspect file between @@<na
   [ -n "$f" ] && awk -v s="@@$2" '/^@@/ { on = ($0 == s); next } on' "$f"
 }
 
+# The command line changes between exercises:
+#   Ex1: <SERVERS> <RAM> <DISK> <CPU> <INPUT_DIR>
+#   Ex2: <SERVERS> <RAM> <DISK> <CPU> <LOCAL_CORES> <INPUT_DIR>        (teacher's FAQ)
+#   Ex3: <SERVERS> <RAM> <DISK> <CPU> <LOCAL_CORES> <INPUT_DIR> <MAX_THREADS>
+# Count the <...> in the program's Usage message to know which one it expects.
+detect_cli() {
+  local n
+  n=$("$BIN" 2>&1 | grep -m1 -i usage | grep -o '<[^>]*>' | wc -l)
+  TAIL=()
+  [ "$n" -ge 6 ] && ARGS+=("$LOCAL_CORES")
+  [ "$n" -ge 7 ] && TAIL=("$MAX_THREADS")
+  echo "command line: cloudIST ${ARGS[*]} <INPUT_DIR> ${TAIL[*]}  (Usage shows $n arguments)"
+  echo
+}
+
 # ------------------------------------------------------------------ main ---
 
 build
+detect_cli
 
 echo "== Exercise 2 tests"
 
@@ -245,13 +264,19 @@ if [ -z "$(find "$OUT/e04_inspect/results" -name 'inspect.*' 2>/dev/null)" ]; th
   fail "the application never ran (see E03)"
 else
   parent=$(section e04_inspect PARENT_COMM)
-  [ "$parent" = "cpulimit" ] || fail "the app's parent process is \"$parent\", expected \"cpulimit\" -> exec cpulimit -q -f -l <pct> -- <exec_path>"
+  if [ "$parent" != "cpulimit" ]; then
+    fail "the app's parent process is \"$parent\", expected \"cpulimit\" -> exec cpulimit -q -f -l <pct> -- <exec_path>"
+  elif [ ${#ARGS[@]} -lt 5 ]; then
+    fail "cloudIST doesn't take <LOCAL_CORES> yet (Usage shows 5 arguments) -> needed for the FAQ formula"
+  else
+    # FAQ: CPULIMIT = 100 * vCPU * LOCAL_CORES / (CPUs_per_server * SERVERS), truncated (TODO decision 3b)
+    expected=$(awk -v v=8 -v l="$LOCAL_CORES" -v c="${ARGS[3]}" -v s="${ARGS[0]}" 'BEGIN { x = int(100 * v * l / (c * s)); print (x < 1 ? 1 : x) }')
+    got=$(section e04_inspect PARENT_CMDLINE | grep -oE -- '-l [0-9]+' | awk '{ print $2 }')
+    [ "$got" = "$expected" ] || fail "cpulimit -l ${got:-?}, expected $expected = 100 x 8 vCPU x $LOCAL_CORES local cores / (${ARGS[3]} CPUs x ${ARGS[0]} servers)"
+  fi
 fi
-report "E10 [passo 6] the application is launched through cpulimit"
-if [ "${parent:-}" = "cpulimit" ]; then
-  info "cpulimit command: $(section e04_inspect PARENT_CMDLINE)"
-  info "with ${ARGS[0]} servers x ${ARGS[3]} CPUs and VMs of 8 vCPU: vCPU/(CPUs*servers)*100 = 25, (vCPU/CPUs)*servers*100 = 100 (see TODO doubt 1)"
-fi
+report "E10 [passo 6] the application is launched through cpulimit with the FAQ's CPULIMIT"
+[ "${parent:-}" = "cpulimit" ] && info "cpulimit command: $(section e04_inspect PARENT_CMDLINE)"
 [ -n "$(section e04_inspect PWD)" ] && info "working directory of the app: $(section e04_inspect PWD) (see TODO doubt 4 about chdir)"
 
 run_case e11_ram
@@ -280,7 +305,7 @@ report "E12 [passo 6] file size limit (RLIMIT_FSIZE) is applied"
 for c in e05_fast_slow e07_parallel; do
   rm -f "$OUT/$c".asan.*
   ASAN_OPTIONS=detect_leaks=1:log_path="$OUT/$c.asan" RESULT_DIR="$OUT/$c/results" \
-    timeout "$TIMEOUT" "$OUT/cloudIST_asan" "${ARGS[@]}" "$OUT/$c/confs" < /dev/null > /dev/null 2>&1
+    timeout "$TIMEOUT" "$OUT/cloudIST_asan" "${ARGS[@]}" "$OUT/$c/confs" "${TAIL[@]}" < /dev/null > /dev/null 2>&1
   for f in "$OUT/$c".asan.*; do
     [ -e "$f" ] && fail "$c: $(grep -m1 SUMMARY "$f" | sed 's/^SUMMARY: //') (see ${f#"$ROOT"/})"
   done

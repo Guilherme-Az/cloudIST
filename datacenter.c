@@ -16,6 +16,8 @@ void datacenter_init(DataCenter *dc) {
   dc->num_reservations = 0;
 
   dc->configured = 0;
+
+  dc->local_cores = 0;//os local cores da maquina local que o stor pediu
 }
 
 void datacenter_destroy(DataCenter *dc) {
@@ -122,7 +124,7 @@ int datacenter_execute(DataCenter *dc, const char *reservation_id) {
   Reservation *res = find_pending_reservation(dc, reservation_id);
   if (!res) return 1;
 
-  if (spawn_all_vms(res) != 0) return 1;
+  if (spawn_all_vms(dc, res) != 0) return 1;
 
   res->state = RES_STATE_RUNNING;
 

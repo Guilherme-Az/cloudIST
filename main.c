@@ -16,8 +16,8 @@ int main(int argc, char **argv){
 	DataCenter dc;
 	datacenter_init(&dc);
 
-	if (argc != 6) {// Adding input_dir 
-    fprintf(stderr, "Usage: %s <servers> <ram> <disk> <cpus> <input_dir>\n", argv[0]);
+	if (argc != 7) {// adicionei o local_cores pedido pelo stor na pagina de duvidas do tecnico
+    fprintf(stderr, "Usage: %s <servers> <ram> <disk> <cpus> <local_cores> <input_dir>\n", argv[0]);
     return 1;
   }
 
@@ -25,13 +25,15 @@ int main(int argc, char **argv){
 	size_t ram;
 	size_t disk;
 	double cpu;
+	size_t local_cores;//numero de cores da máquina local para o CloudIST (FAQ do stor, para o cpulimit)
 	char input_dir[MAX_PATH_SIZE];//Adding input_dir
 
 	if (parse_size_t_arg(argv[1], &servers) != 0 ||
 			parse_size_t_arg(argv[2], &ram) != 0 ||
 			parse_size_t_arg(argv[3], &disk) != 0 ||
 			parse_double_arg(argv[4], &cpu) != 0 ||
-			(argv[5] == NULL || argv[5][0] == '\0')) {//adicionar aqui esta verificação
+			parse_size_t_arg(argv[5], &local_cores) != 0 || local_cores == 0 ||
+			(argv[6] == NULL || argv[6][0] == '\0')) {//adicionar aqui esta verificação
 		fprintf(stderr, "Invalid command line arguments.\n");
 		return 1;
 	}
@@ -48,9 +50,10 @@ int main(int argc, char **argv){
 		fprintf(stderr, "Failed to configure Data Center.\n");
 		return 1;
 	}
+	dc.local_cores = local_cores;
 
 	//função do stor no filesystem- converte para absulute path
-	if (absolute_path(argv[5], input_dir, MAX_PATH_SIZE) != 0) { // Convert to absolute path and put it in input_dir
+	if (absolute_path(argv[6], input_dir, MAX_PATH_SIZE) != 0) { // Convert to absolute path and put it in input_dir
 		fprintf(stderr, "Failed to convert path to absolute path.\n");
 		datacenter_destroy(&dc);
 		return 1;
