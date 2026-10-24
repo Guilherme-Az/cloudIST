@@ -50,7 +50,6 @@ int absolute_path(const char *path, char *buffer, size_t size){
   return 0;
 }
 
-//PERGUNTAR ao stor se posso usar esta função ... e se fica melhor aqui ou na main
 int filter_conf_only(const struct dirent *ficheiro) {
   if (strchr(ficheiro->d_name, '.') == NULL) {
     return 0;
@@ -78,7 +77,7 @@ int copy_path_recursive(const char *source_path, const char *vm_path){
   //o entre é o ficheiro/pasta atual se for null acaba o loop
   while ((entry = readdir(dir)) != NULL) {
 
-    //isto foi o chat que disse é para não entrar em loops infinitos
+    //para não entrar em loops infinitos
     if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
       continue;
     }
@@ -86,11 +85,10 @@ int copy_path_recursive(const char *source_path, const char *vm_path){
     char source_entry_path[MAX_PATH_SIZE];
     char vm_entry_path[MAX_PATH_SIZE];
 
-    //copiar o caminho todo tipo pronto se houver pastas dentro de pastas
+    //copiar o caminho todo se houver pastas dentro de pastas
     snprintf(source_entry_path, MAX_PATH_SIZE, "%s/%s", source_path, entry->d_name);
     snprintf(vm_entry_path, MAX_PATH_SIZE, "%s/%s", vm_path, entry->d_name);
 
-    //uso aqui as funções axiliares do stor
     if (path_exists(source_entry_path)) {
       //cria a diretoria (se já existir não faz mal) e depois a parte recursiva para as pastas dentro de pastas
       if (mkdir(vm_entry_path, 0777) != 0 && errno != EEXIST) {
@@ -125,7 +123,7 @@ int copy_file(const char *source_file, const char *vm_file) {
     return 1;
   }
 
-  //abres o ficheiro de destino para escrever, ali o numero o chat disse que era mm preciso
+  //abres o ficheiro de destino para escrever
   int fd_vm = open(vm_file, O_WRONLY | O_CREAT | O_TRUNC, 0666);
   if (fd_vm < 0) {
     perror("open vm file error");
