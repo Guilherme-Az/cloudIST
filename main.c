@@ -247,6 +247,7 @@ int main(int argc, char **argv){
 		return 1;
 	}
 
+	//cada thread precisa dda sua propria esturutra de argumentos, para não haver race conditions
 	ConfArgs *args = calloc((size_t) n_conf_files, sizeof(ConfArgs));
 
 	if(args == NULL){
@@ -263,6 +264,7 @@ int main(int argc, char **argv){
 	for(int i=0; i < n_conf_files; i++){
 		args[i].dc = &dc;
 		args[i].slots = &slots;
+		//construir o path completo do ficheiro .conf (input_dir + nome do ficheiro)
 		snprintf(args[i].path, sizeof(args[i].path), "%s/%s", input_dir, conf_file_list[i]->d_name);
 		free(conf_file_list[i]);
 
@@ -281,7 +283,7 @@ int main(int argc, char **argv){
 		sem_wait(&slots);
 	}
 
-	//depois de todas as threads acabarem: esperar (1 = bloquear) que todas as vms acabem e destrui-las, antes de sair
+	//depois de todas as threads acabarem: esperar (1 = bloquear) que todas as vms(processos child) acabem e destrui-las, antes de sair
 	datacenter_collect_finished_vms(&dc, 1);
 
 	sem_destroy(&slots);
