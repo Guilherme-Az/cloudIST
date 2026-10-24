@@ -5,6 +5,7 @@
 #include <time.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 
 void datacenter_init(DataCenter *dc) {
   dc->servers = NULL;
@@ -229,4 +230,18 @@ int datacenter_list(DataCenter *dc) {
 void datacenter_wait(unsigned int delay_ms){
   struct timespec delay = (struct timespec){delay_ms / 1000, (delay_ms % 1000) * 1000000};
   nanosleep(&delay, NULL);
+}
+
+void datacenter_collect_finished_vms(DataCenter *dc, int block) {
+  int status;
+  pid_t pid;
+  //está guardado no sistema o estado de todas os processos das children
+  //o waitpid faz ir lá buscar=-1 não tem crianças ou deu erro, 0 há children que ainda não acabaram, >0 é o pid da criança que acabou por último
+  /*waitpid(WHICH_CHILD, &status, OPTIONS)
+  se WHICH_CHILD=-1-> pela ordem que as children acabarem( alternativamente se fosse um pid específico é esse que acabou)
+  &status é how it finished
+  se OPTIONS= WNOHANG -> o parent não bloqueia- usado para, quando parent ainda está a ler comandos
+  alternativamente se  OPTIONS= 0 o parent bloqueia até as crianças acabarem- usado no final da main para esperar que os processos acabem todos*/ 
+  while ((pid = waitpid(-1, &status, block ? 0 : WNOHANG)) > 0)
+    destroy_vm_by_pid(dc, pid);
 }

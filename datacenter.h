@@ -153,4 +153,15 @@ int datacenter_execute(DataCenter *dc, const char *reservation_id);
  */
 void datacenter_wait(unsigned int delay_ms);
 
+/**
+ * Collects VM processes that have finished (waitpid) and destroys each
+ * corresponding VM (see destroy_vm_by_pid). With block = 0 it only collects
+ * the ones that already finished and returns right away; with block = 1 it
+ * waits until there are no more VM processes.
+ *
+ * @param dc Pointer to the Data Center.
+ * @param block 0 = don't wait (WNOHANG), 1 = wait for all.
+ */
+void datacenter_collect_finished_vms(DataCenter *dc, int block);
+
 #endif // DATACENTER__H

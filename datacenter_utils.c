@@ -247,6 +247,8 @@ void spawn_vm_child(VM *vm, const char *reservation_id) {
 		_exit(1);
 	}
 
+	/*está no enunciado usarmos esta estrutura do rlimit,
+	serve para(através do kernerl) definir limites aos recursos que um processo pode usar*/
 	struct rlimit mem, disk;
 
 	//multiplica a ram da vm que está em GB por 2^30 para converter para bytes, e converte para o tipo rlim_t que é o tipo que a struct rlimit espera
@@ -324,4 +326,54 @@ const char *res_state_to_string(ReservationState state) {
 			case RES_STATE_FINISHED: return "FINISHED";
 			default:                 return "UNKNOWN";
     }
+}
+
+void destroy_vm_by_pid(DataCenter *dc, pid_t pid) {
+	//procurar em todas as reservas a vm que tem este pid, pq pode haver várias reservas a correr em paralelo
+	for (size_t i = 0; i < dc->num_reservations; i++) {
+		Reservation *res = &dc->reservations[i];
+
+		for (size_t k = 0; k < res->num_vms; k++) {
+			VM *vm = res->vms[k];
+			if (vm->pid != pid) {
+				continue;
+			}
+
+			Server *server = vm->server;
+
+			//igual a reservation_destroy básicamente aqueles recursos que foram removidos pelo resources_sub no  reservation_commit, após o comando R(reserve), são devolvidos ao server
+			resources_add(&server->available, vm->type->required);
+
+			//tirar a vm da lista do servidor (igual ao reservation_destroy)
+			for (size_t j = 0; j < server->num_hosted_vms; j++) {
+				if (server->hosted_vms[j] == vm) {
+					/*igual ao reservation_destroy, com é uma lista ligada puxar as seguintes vms uma posição para trás, 
+					a partir da vm que se quer retirar
+					*memmove(destino, origem, numero de elementos depois da posição j*tamanho_do_elemento)*/
+					memmove(&server->hosted_vms[j],
+									&server->hosted_vms[j + 1],
+									(server->num_hosted_vms - j - 1) * sizeof(VM *));
+					server->num_hosted_vms--;
+					break;
+				}
+			}
+
+			//tirar a vm da lista da reserva (puxar as seguintes uma posição para trás)
+			memmove(&res->vms[k],
+							&res->vms[k + 1],
+							(res->num_vms - k - 1) * sizeof(VM *));
+			res->num_vms--;
+
+			free(vm);
+
+			//se era a ultima vm da reserva, apaga a reserva
+			//(com 0 vms o reservation_destroy só tira a reserva do array do dc)
+			if (res->num_vms == 0) {
+				reservation_destroy(dc, res);
+			}
+
+			//já encontrámos a vm, depois do reservation_destroy o ponteiro res já não é valido
+			return;
+		}
+	}
 }

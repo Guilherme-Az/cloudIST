@@ -72,6 +72,18 @@ Reservation *find_pending_reservation(DataCenter *dc, const char *reservation_id
 void reservation_destroy(DataCenter *dc, Reservation *reservation);
 
 /**
+ * Destroys the VM whose process has the given pid (called after waitpid()
+ * reports that it finished): returns its resources to the hosting server,
+ * removes it from the server and from its reservation, and frees it. If it
+ * was the last VM of the reservation, the reservation is removed too.
+ * Does nothing if no VM has that pid.
+ *
+ * @param dc Pointer to the Data Center.
+ * @param pid Pid of the finished VM process.
+ */
+void destroy_vm_by_pid(DataCenter *dc, pid_t pid);
+
+/**
  * Runs in the child process after fork(): prepares the VM folder
  * (/tmp/CloudIST/<reservation>/<vm>) with a copy of the inputs, sets
  * resource limits (RAM, disk) and execs the VM's workload under cpulimit.

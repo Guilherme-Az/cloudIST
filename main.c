@@ -100,12 +100,13 @@ int main(int argc, char **argv){
 				free(conf_file_list[j]);
 			}
 			free(conf_file_list);
+			datacenter_collect_finished_vms(&dc, 1);//esperar pelas vms de .confs anteriores que ainda estejam a correr
 			datacenter_destroy(&dc);
         	return 1;
     	}
 		int done = 0;
 		while(!done){ 
-			
+			datacenter_collect_finished_vms(&dc, 0);//verifica se há vms que acabaram de correr e destroi-as, 0 para não bloquear o parent process
 			switch (get_next_command(fd)){
 				case CMD_DEFINE: {
 					VMType vmtype;
@@ -213,6 +214,8 @@ int main(int argc, char **argv){
 		close(fd);
 		free(conf_file_list[i]); //libertar a memoria alocada pelo scandir
 	}
+	//depois de todos os .conf esperar (1 = bloquear) que todas as vms acabem e destrui-las, antes de sair
+	datacenter_collect_finished_vms(&dc, 1);
 	datacenter_destroy(&dc);
 	free(conf_file_list);
 	return 0; //libertar a memoria alocada pelo scandir
