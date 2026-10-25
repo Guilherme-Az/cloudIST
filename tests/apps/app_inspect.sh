@@ -4,8 +4,11 @@
 #   - its open file descriptors (the .conf must not be inherited)
 #   - its parent process (must be cpulimit in step 6) and the cpulimit command line
 #   - its working directory
+#   - where its stdout goes (must be /dev/null)
 OUT="$RESULT_DIR/inspect.$$"
-VM=/tmp/CloudIST/E04/E04_1
+# where fd 1 (stdout) points to, read BEFORE the { } > "$OUT" below redirects it
+STDOUT_TARGET=$(readlink /proc/$$/fd/1)
+VM=/tmp/CloudIST-114255/E04/E04_1
 {
   echo "@@LISTING"
   if [ -d "$VM" ]; then
@@ -15,6 +18,8 @@ VM=/tmp/CloudIST/E04/E04_1
   fi
   echo "@@FDS"
   for fd in /proc/$$/fd/*; do printf '%s -> %s\n' "${fd##*/}" "$(readlink "$fd")"; done
+  echo "@@STDOUT"
+  echo "$STDOUT_TARGET"
   echo "@@PARENT_COMM"
   cat /proc/$PPID/comm
   echo "@@PARENT_CMDLINE"

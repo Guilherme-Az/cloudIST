@@ -8,9 +8,11 @@
 #
 #   X01-X03  MAX_THREADS is respected and .conf files really run in parallel
 #   X04      never more than MAX_THREADS worker threads at the same time
+#            (+ the main thread + the VM reaper thread)
 #   X05      stress: 40 .conf files at once, everything defined/reserved/run
 #   X06      capacity: 20 threads fight for a server with room for 10 VMs ->
-#            exactly 10 reservations may succeed (without locks, more can get in)
+#            10 get in, the other 10 WAIT for free resources and get in when the
+#            first VMs end: all 20 run, but never more than 10 at the same time
 #   X07      ThreadSanitizer: 0 data races (this is the real test for the locks)
 #   X08      AddressSanitizer: no leaks / memory errors under load
 
@@ -19,7 +21,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 T="$ROOT/tests"
 OUT="$T/out/ex3"
-CLOUD=/tmp/CloudIST
+CLOUD=/tmp/CloudIST-114255
 BIN="$ROOT/cloudIST"
 LOCAL_CORES=4
 TIMEOUT=60
@@ -40,6 +42,10 @@ report() {
   fi
   REASONS=()
 }
+
+# now_s: seconds since boot (monotonic). Not `date`: on WSL the wall clock
+# sometimes jumps back ~2 s, which made timing tests fail at random.
+now_s() { cut -d' ' -f1 /proc/uptime; }
 
 # ---------------------------------------------------------------- setup ----
 
@@ -78,7 +84,7 @@ run() {
   rm -rf "$CLOUD" "$OUT/$c/results"; mkdir -p "$OUT/$c/results"
   local start end pid n
   MAX_TASKS=0
-  start=$(date +%s%N)
+  start=$(now_s)
   RESULT_DIR="$OUT/$c/results" timeout "$TIMEOUT" "$bin" "$servers" 64 64 "$cpus" "$LOCAL_CORES" "$OUT/$c/confs" "$mt" \
     < /dev/null > "$OUT/$c/stdout" 2> "$OUT/$c/stderr" &
   pid=$!
@@ -93,8 +99,8 @@ run() {
     sleep 0.01
   done
   wait "$pid"; RC=$?
-  end=$(date +%s%N)
-  ELAPSED=$(awk -v s="$start" -v e="$end" 'BEGIN { printf "%.2f", (e - s) / 1e9 }')
+  end=$(now_s)
+  ELAPSED=$(awk -v s="$start" -v e="$end" 'BEGIN { printf "%.2f", e - s }')
 }
 
 check_exit() {
@@ -122,10 +128,11 @@ make_cases() {
   done
 
   # 20 .conf files, each wants 1 VM of 1 vCPU on server 1, which has 10 CPUs.
-  # The app runs 3 s, so no VM ends (and gives its CPU back) during the test.
+  # The app records when it started and runs 3 s: the first 10 get in, the other
+  # 10 wait until those end, so there are two "waves" ~3 s apart.
   c="$OUT/capacity/confs"; mkdir -p "$c"
   for i in $(seq -w 1 20); do
-    printf 'D C%s %s/inputs/small %s/apps/app_sleep3.sh 1 1 1\nR CAP%s C%s 1 1\nA CAP%s\n' \
+    printf 'D C%s %s/inputs/small %s/apps/app_wave.sh 1 1 1\nR CAP%s C%s 1 1\nA CAP%s\n' \
       "$i" "$OUT" "$OUT" "$i" "$i" "$i" > "$c/c$i.conf"
   done
 }
@@ -150,11 +157,11 @@ between "$ELAPSED" 0.8 1.8 || fail "MAX_THREADS=4 with 4 waits of 1 s took ${ELA
 X03_TASKS=$MAX_TASKS
 report "X03 MAX_THREADS=4: all four .conf files at once (took ${ELAPSED}s)"
 
-# ---- X04: never more threads than allowed (main thread + MAX_THREADS workers)
+# ---- X04: never more threads than allowed (main thread + VM reaper + MAX_THREADS workers)
 run waits 2 2 16; check_exit
-[ "$MAX_TASKS" -le 3 ] || fail "saw $MAX_TASKS threads at once with MAX_THREADS=2 (expected at most 1 main + 2 workers)"
-[ "$MAX_TASKS" -ge 3 ] || info "only saw $MAX_TASKS threads at once (sampling may have missed one)"
-report "X04 never more than MAX_THREADS worker threads (max seen: $MAX_TASKS incl. main; with 4: $X03_TASKS)"
+[ "$MAX_TASKS" -le 4 ] || fail "saw $MAX_TASKS threads at once with MAX_THREADS=2 (expected at most 1 main + 1 reaper + 2 workers)"
+[ "$MAX_TASKS" -ge 4 ] || info "only saw $MAX_TASKS threads at once (sampling may have missed one)"
+report "X04 never more than MAX_THREADS worker threads (max seen: $MAX_TASKS incl. main + reaper; with 4: $X03_TASKS)"
 
 # ---- X05: stress
 run stress 8 4 16; check_exit
@@ -169,13 +176,20 @@ errs=$(grep -vE "^$|^No process found$" "$OUT/stress/stderr" | sort | uniq -c | 
 [ -n "$errs" ] && fail "unexpected errors: $errs"
 report "X05 stress: 40 .conf files with 8 threads — all defined, reserved and run"
 
-# ---- X06: capacity race
+# ---- X06: capacity race + waiting reservations
 run capacity 8 1 10; check_exit
 ok=$(grep -c "Reservation made successfully!" "$OUT/capacity/stdout")
-no=$(grep -c "does not have enough resources" "$OUT/capacity/stderr")
-[ "$ok" -eq 10 ] || fail "$ok reservations succeeded on a server with room for 10 -> $( [ "$ok" -gt 10 ] && echo 'two threads took the same CPUs (validate/commit not protected by the same lock)' || echo 'too few: resources lost or wrongly counted' )"
-[ "$no" -eq 10 ] || fail "$no reservations were refused for lack of resources, expected 10"
-report "X06 capacity: 20 threads, server with room for 10 -> exactly 10 reservations ($ok ok, $no refused)"
+waited=$(grep -c "Waiting" "$OUT/capacity/stderr")
+ran=$(find "$OUT/capacity/results" -name 'start.*' | wc -l)
+# how many apps started in the first wave (within 1.5 s of the first one): must be exactly 10
+first_wave=$(cat "$OUT/capacity/results"/start.* 2>/dev/null | sort -n | awk 'NR == 1 { t0 = $1 } $1 - t0 < 1.5 { n++ } END { print n + 0 }')
+[ "$ok" -eq 20 ] || fail "$ok of 20 reservations made (the ones that don't fit must wait, not fail)"
+[ "$ran" -eq 20 ] || fail "$ran of 20 applications ran"
+[ "$first_wave" -le 10 ] || fail "$first_wave VMs were running at the same time on a server with room for 10 -> two threads took the same CPUs (check and commit not protected by the same lock)"
+[ "$first_wave" -eq 10 ] || fail "only $first_wave VMs in the first wave, expected 10 (resources lost or wrongly counted)"
+[ "$waited" -ge 1 ] || fail "no reservation said it was waiting for resources"
+between "$ELAPSED" 5.5 9 || fail "took ${ELAPSED}s, expected ~6 s (two waves of 3 s)"
+report "X06 capacity: server with room for 10, 20 reservations -> 10 at a time, the rest wait ($ok ok, first wave $first_wave, ${ELAPSED}s)"
 
 # ---- X07: ThreadSanitizer
 if ! setarch "$(uname -m)" -R true 2>/dev/null; then

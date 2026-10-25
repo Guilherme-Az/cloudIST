@@ -5,7 +5,11 @@
 #
 # For every case it checks:
 #   - the program exits normally (no crash / signal / timeout)
-#   - diff -r <input dir> /tmp/CloudIST/<res>/<vm> is empty for every VM
+#   - diff -r <input dir> <VM folder> is empty for every VM. The VM folder is
+#     deleted when the VM ends, so the app (tests/apps/app_snapshot.sh) copies
+#     its working directory (= the VM folder, after CloudIST's chdir) when it
+#     starts, and the test diffs that copy
+#   - /tmp/CloudIST-114255/<res> no longer exists after the run (deleted when the VMs end)
 #   - the copy was complete when the application started (snapshot taken by
 #     tests/tools/startcheck.so at the moment the app is launched)
 #   - no file descriptors other than 0/1/2 are open at exit
@@ -19,7 +23,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 T="$ROOT/tests"
 OUT="$T/out"
 IN="$T/inputs"
-CLOUD=/tmp/CloudIST
+CLOUD=/tmp/CloudIST-114255
 BIN="$ROOT/cloudIST"
 ARGS=(2 64 1000 16)          # SERVERS RAM DISK CPU
 LOCAL_CORES=4                # only used if the program expects it (see detect_cli)
@@ -59,7 +63,7 @@ build() {
   local SRC=(main.c parser.c datacenter.c datacenter_utils.c resources.c filesystem.c)
   gcc -shared -fPIC -O1 -o "$OUT/startcheck.so" "$T/tools/startcheck.c" -ldl || exit 1
   gcc -std=c17 -D_POSIX_C_SOURCE=200809L -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-      -o "$OUT/cloudIST_asan" "${SRC[@]}" -lm || exit 1
+      -o "$OUT/cloudIST_asan" "${SRC[@]}" -lm -pthread || exit 1
   gcc -std=c17 -D_POSIX_C_SOURCE=200809L -g -fsanitize=address,undefined -fno-omit-frame-pointer \
       -o "$OUT/unit_copy" "$T/tools/unit_copy.c" filesystem.c || exit 1
 
@@ -120,8 +124,8 @@ gen_inputs() {
 # run_prog <name> <input_dir_arg>   -> fills $OUT/<name>.{stdout,stderr,rc,log}
 run_prog() {
   local name=$1 dir=$2
-  rm -f "$OUT/$name".*
-  CLOUDIST_TEST_LOG="$OUT/$name.log" LD_PRELOAD="$OUT/startcheck.so" \
+  rm -rf "$OUT/$name".*
+  SNAPSHOT_DIR="$OUT/$name.snap" CLOUDIST_TEST_LOG="$OUT/$name.log" LD_PRELOAD="$OUT/startcheck.so" \
     timeout "$TIMEOUT" "$BIN" "${ARGS[@]}" "$dir" "${TAIL[@]}" < /dev/null \
     > "$OUT/$name.stdout" 2> "$OUT/$name.stderr"
   RC=$?
@@ -224,14 +228,15 @@ snapshot_verdict() {
 
 # check_copy <name> <res> <vm> <src>
 check_copy() {
-  local name=$1 res=$2 vm=$3 src=$4 dst="$CLOUD/$2/$3"
-  if [ ! -d "$dst" ]; then
-    fail "$dst was not created"
+  local name=$1 res=$2 vm=$3 src=$4 dst="$CLOUD/$2/$3" snap="$OUT/$1.snap/$2/$3"
+  if [ ! -d "$snap" ]; then
+    fail "the app of $vm never ran in its VM folder (no snapshot in ${snap#"$ROOT"/}: VM folder not created, or no chdir into it)"
     return
   fi
+  [ -e "$CLOUD/$res" ] && fail "$CLOUD/$res still exists after the run (the VM folder must be deleted when the VM ends)"
   local d
-  if ! d=$(diff -r "$src" "$dst" 2>&1); then
-    fail "diff -r ${src#"$ROOT"/} $dst differs:"
+  if ! d=$(diff -r "$src" "$snap" 2>&1); then
+    fail "diff -r ${src#"$ROOT"/} $dst (as the app saw it) differs:"
     while IFS= read -r line; do REASONS+=("    $line"); done < <(head -8 <<< "$d")
   fi
   case "$(snapshot_verdict "$name" "$res" "$vm" "$src")" in

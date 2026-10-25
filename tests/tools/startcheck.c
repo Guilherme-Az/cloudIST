@@ -2,7 +2,7 @@
  * LD_PRELOAD helper for run_tests.sh (test-only, not part of the project).
  *
  * 1. "Application start" snapshot: when the program is about to start a VM
- *    application, a listing of /tmp/CloudIST (type, size, path) is appended to
+ *    application, a listing of /tmp/CloudIST-114255 (type, size, path) is appended to
  *    $CLOUDIST_TEST_LOG. Start is detected by:
  *      - the base-code stub message "VM execution not implemented" (exercise 1)
  *      - fork()/execve()/execv()/execvp() (exercise 2 onwards)
@@ -25,7 +25,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#define CLOUD_ROOT "/tmp/CloudIST"
+#define CLOUD_ROOT "/tmp/CloudIST-114255"
 #define START_MSG "VM execution not implemented"
 
 static int log_fd = -1;

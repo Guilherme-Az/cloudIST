@@ -9,6 +9,10 @@
 #   [passo 4]   each VM destroyed when its app ends (waitpid WNOHANG)
 #   [passo 5]   program waits for the remaining VMs before exiting
 #   [passo 6]   setrlimit (RAM, file size) + cpulimit
+#   [novo]      behaviour taken from the teacher's proposed solution: chdir into
+#               the VM folder, app stdout -> /dev/null, CPULIMIT rounded, VM folder
+#               deleted when the VM ends, R waits for free resources, one R per
+#               .conf, A needs an R, a failed D/R skips the rest of the .conf
 # So it's expected that tests of later steps FAIL while you're on earlier ones.
 #
 # Each VM runs a small app from tests/apps/ that leaves a marker file in
@@ -19,7 +23,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 T="$ROOT/tests"
 OUT="$T/out/ex2"
-CLOUD=/tmp/CloudIST
+CLOUD=/tmp/CloudIST-114255
 BIN="$ROOT/cloudIST"
 ARGS=(2 64 1000 16)          # SERVERS RAM DISK CPU  (VMs in the cases: 1 GB RAM, 1 GB disk, 8 vCPU)
 LOCAL_CORES=4                # only used if the program expects it (see detect_cli)
@@ -46,6 +50,10 @@ report() {   # report <name>
   REASONS=()
 }
 
+# now_s: seconds since boot (monotonic). Not `date`: on WSL the wall clock
+# sometimes jumps back ~2 s, which made timing tests fail at random.
+now_s() { cut -d' ' -f1 /proc/uptime; }
+
 # ---------------------------------------------------------------- setup ----
 
 build() {
@@ -57,7 +65,7 @@ build() {
 
   gcc -shared -fPIC -O1 -o "$OUT/startcheck.so" "$T/tools/startcheck.c" -ldl || exit 1
   gcc -std=c17 -D_POSIX_C_SOURCE=200809L -g -fsanitize=address,undefined -fno-omit-frame-pointer \
-      -o "$OUT/cloudIST_asan" main.c parser.c datacenter.c datacenter_utils.c resources.c filesystem.c -lm || exit 1
+      -o "$OUT/cloudIST_asan" main.c parser.c datacenter.c datacenter_utils.c resources.c filesystem.c -lm -pthread || exit 1
 
   cp "$T"/apps/*.sh "$T/apps/not_executable.txt" "$OUT/apps/"
   gcc -O1 -o "$OUT/apps/ram_hog" "$T/apps/ram_hog.c" || exit 1
@@ -87,12 +95,12 @@ run_case() {
   prepare "$c"
   rm -rf "$CLOUD"
   local start end
-  start=$(date +%s%N)
+  start=$(now_s)
   RESULT_DIR="$OUT/$c/results" CLOUDIST_TEST_LOG="$OUT/$c/startcheck.log" LD_PRELOAD="$OUT/startcheck.so" \
     timeout "$TIMEOUT" "$bin" "${ARGS[@]}" "$OUT/$c/confs" "${TAIL[@]}" < /dev/null > "$OUT/$c/stdout" 2> "$OUT/$c/stderr"
   RC=$?
-  end=$(date +%s%N)
-  ELAPSED=$(awk -v s="$start" -v e="$end" 'BEGIN { printf "%.2f", (e - s) / 1e9 }')
+  end=$(now_s)
+  ELAPSED=$(awk -v s="$start" -v e="$end" 'BEGIN { printf "%.2f", e - s }')
   touch "$OUT/$c/startcheck.log"
 }
 
@@ -153,6 +161,12 @@ detect_cli() {
   echo
 }
 
+# cpulimit_expected <vcpu>: FAQ formula, rounded to the nearest, between 1 and 100 * LOCAL_CORES
+cpulimit_expected() {
+  awk -v v="$1" -v l="$LOCAL_CORES" -v c="${ARGS[3]}" -v s="${ARGS[0]}" \
+    'BEGIN { x = int(100 * v * l / (c * s) + 0.5); if (x < 1) x = 1; if (x > 100 * l) x = 100 * l; print x }'
+}
+
 # ------------------------------------------------------------------ main ---
 
 build
@@ -194,7 +208,7 @@ if [ -z "$(find "$OUT/e04_inspect/results" -name 'inspect.*' 2>/dev/null)" ]; th
 else
   seen=$(section e04_inspect LISTING)
   expected=$(cd "$OUT/inputs/small" && { find . -mindepth 1 -type d -printf 'd 0 %P\n'; find . -mindepth 1 -type f -printf 'f %s %P\n'; } | LC_ALL=C sort)
-  if [ "$seen" = "NO_VM_DIR" ]; then fail "/tmp/CloudIST/E04/E04_1 did not exist when the app started"
+  if [ "$seen" = "NO_VM_DIR" ]; then fail "/tmp/CloudIST-114255/E04/E04_1 did not exist when the app started"
   elif [ "$seen" != "$expected" ]; then fail "the VM folder was incomplete when the app started: $(diff <(echo "$expected") <(echo "$seen") | grep '^[<>]' | head -3 | paste -sd ';' -)"
   fi
   report "E03 [passo 3] inputs fully copied into the VM folder when the app starts"
@@ -226,6 +240,7 @@ else
   used=$(grep "Resources Used" <<< "$L2" | grep -vcE ':\s+0\.00 vCPUs \|\s+0 GB RAM \|\s+0 GB Disk')
   [ "$used" -eq 0 ] || fail "after 4.5 s: resources were not given back to the servers ($(grep 'Resources Used' <<< "$L2" | head -1 | sed 's/^ *//'))"
 fi
+[ -e "$CLOUD/E05" ] && fail "/tmp/CloudIST-114255/E05 still exists after the run (the VM folders, and the empty reservation folder, must be deleted when the VMs end)"
 check_fds e05_fast_slow
 report "E06 [passo 4] when the last VM ends, the reservation is deleted and all resources return"
 
@@ -269,15 +284,82 @@ else
   elif [ ${#ARGS[@]} -lt 5 ]; then
     fail "cloudIST doesn't take <LOCAL_CORES> yet (Usage shows 5 arguments) -> needed for the FAQ formula"
   else
-    # FAQ: CPULIMIT = 100 * vCPU * LOCAL_CORES / (CPUs_per_server * SERVERS), truncated (TODO decision 3b)
-    expected=$(awk -v v=8 -v l="$LOCAL_CORES" -v c="${ARGS[3]}" -v s="${ARGS[0]}" 'BEGIN { x = int(100 * v * l / (c * s)); print (x < 1 ? 1 : x) }')
+    # FAQ: CPULIMIT = 100 * vCPU * LOCAL_CORES / (CPUs_per_server * SERVERS), rounded, between 1 and 100 * LOCAL_CORES
+    expected=$(cpulimit_expected 8)
     got=$(section e04_inspect PARENT_CMDLINE | grep -oE -- '-l [0-9]+' | awk '{ print $2 }')
     [ "$got" = "$expected" ] || fail "cpulimit -l ${got:-?}, expected $expected = 100 x 8 vCPU x $LOCAL_CORES local cores / (${ARGS[3]} CPUs x ${ARGS[0]} servers)"
   fi
 fi
 report "E10 [passo 6] the application is launched through cpulimit with the FAQ's CPULIMIT"
 [ "${parent:-}" = "cpulimit" ] && info "cpulimit command: $(section e04_inspect PARENT_CMDLINE)"
-[ -n "$(section e04_inspect PWD)" ] && info "working directory of the app: $(section e04_inspect PWD) (see TODO doubt 4 about chdir)"
+
+# ---- E14 / E15 (what the app sees: working directory and stdout)
+if [ -z "$(find "$OUT/e04_inspect/results" -name 'inspect.*' 2>/dev/null)" ]; then
+  fail "the application never ran (see E03)"
+else
+  pwd_seen=$(section e04_inspect PWD)
+  [ "$pwd_seen" = "/tmp/CloudIST-114255/E04/E04_1" ] || fail "the app's working directory is \"$pwd_seen\", expected its VM folder /tmp/CloudIST-114255/E04/E04_1 -> chdir(vm_dir) in the child before exec"
+fi
+report "E14 [novo] the app runs inside its VM folder (chdir)"
+if [ -n "$(find "$OUT/e04_inspect/results" -name 'inspect.*' 2>/dev/null)" ]; then
+  out_fd=$(section e04_inspect STDOUT)
+  [ "$out_fd" = "/dev/null" ] || fail "the app's stdout (fd 1) is \"$out_fd\", expected /dev/null -> open(\"/dev/null\") + dup2(fd, STDOUT_FILENO) in the child"
+else
+  fail "the application never ran (see E03)"
+fi
+report "E15 [novo] the app's stdout goes to /dev/null"
+
+# ---- E16 (CPULIMIT rounding: 12.5 -> 13)
+run_case e16_cpu_round
+check_exit e16_cpu_round
+got=$(section e16_cpu_round PARENT_CMDLINE | grep -oE -- '-l [0-9]+' | awk '{ print $2 }')
+expected=$(cpulimit_expected 1)
+[ "$got" = "$expected" ] || fail "cpulimit -l ${got:-?}, expected $expected (100 x 1 vCPU x $LOCAL_CORES / (${ARGS[3]} x ${ARGS[0]}) = 12.5, rounded to the nearest -> lround)"
+report "E16 [novo] CPULIMIT is rounded to the nearest integer (12.5 -> $expected)"
+
+# ---- E17 (only one R per .conf)
+run_case e17_two_r
+check_exit e17_two_r
+grep -q "Only one reservation" "$OUT/e17_two_r/stderr" || fail "the second R in the same .conf was not refused"
+r=$(grep -c "Reservation made successfully!" "$OUT/e17_two_r/stdout")
+[ "$r" -eq 1 ] || fail "$r reservations made, expected 1"
+n=$(count_markers e17_two_r quick)
+[ "$n" -eq 1 ] || fail "$n applications ran, expected 1 (the first R must still run)"
+report "E17 [novo] only one R per .conf: the second one is refused, the first one runs"
+
+# ---- E18 (A without R)
+run_case e18_a_without_r
+check_exit e18_a_without_r
+grep -q "No reservation was made" "$OUT/e18_a_without_r/stderr" || fail "A without an R before it gave no error"
+[ "$(count_markers e18_a_without_r quick)" -eq 0 ] || fail "an application ran without any R"
+[ -n "$(lblock e18_a_without_r 1)" ] || fail "the L after the refused A did not run (an A error must not skip the rest of the file)"
+report "E18 [novo] A without an R in the same .conf -> error, the file goes on"
+
+# ---- E19 (failed D skips the rest of the .conf)
+run_case e19_d_fails
+check_exit e19_d_fails
+grep -q "Skipping the rest" "$OUT/e19_d_fails/stderr" || fail "no message saying the rest of the .conf was skipped"
+grep -qE "Reservation made|VM of type" "$OUT/e19_d_fails/stdout" "$OUT/e19_d_fails/stderr" && fail "the R after the failed D was still processed"
+report "E19 [novo] a failed D skips the rest of the .conf"
+
+# ---- E20 (R that can never fit fails right away)
+run_case e20_r_impossible
+check_exit e20_r_impossible
+grep -q "Skipping the rest" "$OUT/e20_r_impossible/stderr" || fail "the R that can never fit did not fail (or didn't skip the rest of the file)"
+grep -q "Waiting" "$OUT/e20_r_impossible/stderr" && fail "the R waited for resources although it can never fit (20 vCPU > 16 CPUs)"
+awk -v t="$ELAPSED" 'BEGIN { exit !(t < 2) }' || fail "took ${ELAPSED}s, expected an immediate failure"
+[ "$(count_markers e20_r_impossible quick)" -eq 0 ] || fail "the A after the failed R still ran"
+report "E20 [novo] an R that can never fit fails right away and skips the rest (took ${ELAPSED}s)"
+
+# ---- E21 (R waits for free resources)
+run_case e21_r_waits
+check_exit e21_r_waits
+r=$(grep -c "Reservation made successfully!" "$OUT/e21_r_waits/stdout")
+[ "$r" -eq 2 ] || fail "$r of 2 reservations made (the second one must wait, not fail)"
+grep -q "Waiting" "$OUT/e21_r_waits/stderr" || fail "the second R did not say it was waiting for resources"
+[ "$(count_markers e21_r_waits sleep2)" -eq 2 ] || fail "$(count_markers e21_r_waits sleep2) of 2 applications ran"
+awk -v t="$ELAPSED" 'BEGIN { exit !(t >= 3.5 && t < 6.5) }' || fail "took ${ELAPSED}s, expected ~4 s (2 s VM, then the waiting one runs 2 s)"
+report "E21 [novo] an R without free resources waits for a VM to end, then runs (took ${ELAPSED}s)"
 
 run_case e11_ram
 check_exit e11_ram

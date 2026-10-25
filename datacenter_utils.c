@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
@@ -16,15 +18,6 @@ VMType *VMType_exists(DataCenter *dc, const char* type_id){
 	return NULL;
 }
 
-/**
- * Checks if a reservation with the given id already exists in the Data Center.
- * 
- * @param dc Pointer to Data Center.
- * @param reservation_id Id of the reservation being checked.
- * 
- * @return 1 if the reservation exists.
- * @return 0 if the reservation does not exist.
- */	
 int reservation_exists(DataCenter *dc, const char* reservation_id){
 	for(size_t i = 0; i < dc->num_reservations; i++){
 		if(strncmp(reservation_id, dc->reservations[i].id, MAX_STRING_SIZE) == 0){
@@ -35,22 +28,19 @@ int reservation_exists(DataCenter *dc, const char* reservation_id){
 }
 
 int reservation_validate(DataCenter *dc, Reservation *reservation) {
-	//(a verificação do id repetido passou para o datacenter_reserve, porque lê o array
-	//das reservas e precisa do lock das reservas, que não se tranca aqui)
+	//(the repeated id check is in datacenter_reserve, because it reads the reservations
+	//list and needs the reservations lock, which is not held here)
 
-	Resources available[dc->num_servers];
+	/* Simulate the allocation on each server's TOTAL resources: if it doesn't fit even on
+	 * empty servers it can never fit (fail now); if it does, the R may wait for free resources.
+	 * total never changes after datacenter_configure, so it can be read without the server locks. */
+	Resources total_left[dc->num_servers];
 	size_t hosted_count[dc->num_servers];
 	size_t vms_count = 0;
 
-	/* Copy current server resources and hosted_vms so we can simulate the allocation.
-	 * Só dos servidores usados pela reserva: são os únicos trancados (lock_reservation_servers),
-	 * ler os outros seria uma data race (e o valor nem é usado). */
-	for (size_t i = 0; i < reservation->items_count; i++) {
-		size_t id = reservation->items[i].server_id;
-		if (id >= 1 && id <= dc->num_servers) {
-			available[id - 1] = dc->servers[id - 1].available;
-			hosted_count[id - 1] = dc->servers[id - 1].num_hosted_vms;
-		}
+	for (size_t i = 0; i < dc->num_servers; i++) {
+		total_left[i] = dc->servers[i].total;
+		hosted_count[i] = 0;
 	}
 
 	for (size_t i = 0; i < reservation->items_count; i++) {
@@ -78,37 +68,68 @@ int reservation_validate(DataCenter *dc, Reservation *reservation) {
 				fprintf(stderr, "Reached max of VMS for a reservation.\n");
 				return 1;
 			}
-			
-			if (hosted_count[item->server_id - 1] >= MAX_HOSTED_VMS) {
-        fprintf(stderr,
-                "Server \"%zu\" reached the maximum number of hosted VMs.\n",
-                item->server_id);
-        return 1;
-    	}
 
-			if (!resources_can_fit(available[item->server_id-1], vm_type->required)) {
-				fprintf(stderr, "Server \"%zu\" does not have enough resources.\n", item->server_id);
+			if (hosted_count[item->server_id - 1] >= MAX_HOSTED_VMS) {
+				fprintf(stderr,
+				        "Server \"%zu\" can't host that many VMs.\n",
+				        item->server_id);
 				return 1;
 			}
 
-			resources_sub(&available[item->server_id-1], vm_type->required);
+			if (!resources_can_fit(total_left[item->server_id-1], vm_type->required)) {
+				fprintf(stderr, "Server \"%zu\" does not have enough total resources for this reservation.\n", item->server_id);
+				return 1;
+			}
+
+			resources_sub(&total_left[item->server_id-1], vm_type->required);
 			hosted_count[item->server_id-1]++;
 			vms_count++; // One VM "reserved"
 		}
 
-		// Attach vm_type to item for later use.
+		// Attach vm_type to item for later use (types are never moved or deleted, so the pointer stays valid).
 		item->vm_type = vm_type;
 	}
 
 	return 0;
 }
 
-/**
- * Rolls back the changes made by a reservation operation.
- * 
- * @param reservation Pointer to the reservation being rolled back.
- * @param initial_vms Number of VMs that existed before the operation.
- */
+int reservation_fits_now(DataCenter *dc, Reservation *reservation) {
+	Resources available[dc->num_servers];
+	size_t hosted_count[dc->num_servers];
+
+	/* Copy the current available resources and hosted vms, so we can simulate the allocation.
+	 * Only the servers used by the reservation: they are the only ones locked
+	 * (lock_reservation_servers); reading the others would be a data race. */
+	for (size_t i = 0; i < reservation->items_count; i++) {
+		size_t id = reservation->items[i].server_id;
+		available[id - 1] = dc->servers[id - 1].available;
+		hosted_count[id - 1] = dc->servers[id - 1].num_hosted_vms;
+	}
+
+	for (size_t i = 0; i < reservation->items_count; i++) {
+		ReservationItem *item = &reservation->items[i];
+		size_t idx = item->server_id - 1;
+
+		for (size_t j = 0; j < item->amount; j++) {
+			if (hosted_count[idx] >= MAX_HOSTED_VMS || !resources_can_fit(available[idx], item->vm_type->required)) {
+				return 0;
+			}
+			resources_sub(&available[idx], item->vm_type->required);
+			hosted_count[idx]++;
+		}
+	}
+
+	return 1;
+}
+
+void notify_resources_freed(DataCenter *dc) {
+	//new version -> every R waiting in datacenter_reserve wakes up and tries again
+	pthread_mutex_lock(&dc->resources_lock);
+	dc->resources_version++;
+	pthread_cond_broadcast(&dc->resources_cond);
+	pthread_mutex_unlock(&dc->resources_lock);
+}
+
 void reservation_rollback(Reservation *reservation, size_t initial_vms){
 	while (reservation->num_vms > initial_vms) {
 		VM *vm = reservation->vms[reservation->num_vms - 1];
@@ -119,8 +140,8 @@ void reservation_rollback(Reservation *reservation, size_t initial_vms){
 		resources_add(&server->available, vm->type->required);
 
 		// Remove VM from server hosted list.
-		// Procura a vm em vez de assumir que é a última: com threads, entre o commit e o
-		// rollback (fase 3 do datacenter_reserve) outra reserva pode ter acrescentado vms a este servidor
+		// Look for the vm instead of assuming it is the last one: with threads, between the commit and the
+		// rollback (phase 3 of datacenter_reserve) another reservation may have added vms to this server
 		for (size_t j = 0; j < server->num_hosted_vms; j++) {
 			if (server->hosted_vms[j] == vm) {
 				memmove(&server->hosted_vms[j],
@@ -250,20 +271,56 @@ void reservation_destroy(DataCenter *dc, Reservation *reservation) {
 	dc->num_reservations--;
 }
 
-void spawn_vm_child(VM *vm, const char *reservation_id, double cpu_percentage) {
+/**
+ * CPU limit (cpulimit -l) of a VM, teacher's FAQ formula:
+ *   CPULIMIT = 100 * VM vCPUs * local cores / (CPUs per server * number of servers)
+ * Rounded to the nearest integer (cpulimit only takes integers), at least 1
+ * (very small VMs would get 0) and at most 100 * local cores (the whole share
+ * of the local machine given to CloudIST). It may be above 100.
+ *
+ * @param dc Pointer to the Data Center.
+ * @param vm VM being launched.
+ *
+ * @return The value for cpulimit -l.
+ */
+static long vm_cpu_limit(DataCenter *dc, VM *vm) {
+	double limit = 100.0 * vm->type->required.cpu * (double)dc->local_cores
+	               / (vm->server->total.cpu * (double)dc->num_servers);
+	long max_limit = 100 * (long)dc->local_cores;
+	long rounded = lround(limit);
 
-	//prepara a pasta da vm (criar, limpar, copiar inputs) antes dos limites, para a copia não ficar limitada
-	//se falhar, o filho sai sem correr a app (a vm acaba logo e é destruida como as outras)
-	if (make_vm_folder_path(vm->type->input_folder, reservation_id, vm->id) != 0) {
+	if (rounded < 1) {
+		return 1;
+	}
+	if (rounded > max_limit) {
+		return max_limit;
+	}
+	return rounded;
+}
+
+void spawn_vm_child(VM *vm, const char *reservation_id, long cpu_limit) {
+
+	//prepare the vm folder (create, clean, copy inputs) before the limits, so the copy isn't limited
+	//if it fails, the child leaves without running the app (the vm ends right away and is destroyed like the others)
+	char vm_dir[MAX_PATH_SIZE];
+	if (make_vm_folder_path(vm->type->input_folder, reservation_id, vm->id, vm_dir, sizeof(vm_dir)) != 0) {
 		fprintf(stderr, "Failed to prepare input folder for VM %s.\n", vm->id);
 		_exit(1);
 	}
 
-	/*está no enunciado usarmos esta estrutura do rlimit,
-	serve para(através do kernerl) definir limites aos recursos que um processo pode usar*/
+	//the app runs inside the vm folder (chdir below), so a relative exec_path from the D command
+	//would stop working: turn it into an absolute path first, while we are still in the original folder
+	char exec_path[MAX_PATH_SIZE];
+	if (absolute_path(vm->type->exec_path, exec_path, sizeof(exec_path)) != 0) {
+		fprintf(stderr, "Failed to get the absolute path of the executable of VM %s.\n", vm->id);
+		_exit(1);
+	}
+
+	/*the rlimit struct is the one from the project statement,
+	it is used (through the kernel) to set limits on the resources a process can use*/
 	struct rlimit mem, disk;
 
-	//multiplica a ram da vm que está em GB por 2^30 para converter para bytes, e converte para o tipo rlim_t que é o tipo que a struct rlimit espera
+	//the vm ram is in GB: shift by 30 (2^30) to get bytes, and cast to rlim_t, the type the rlimit struct expects
 	mem.rlim_cur = (rlim_t)vm->type->required.ram << 30;
 	mem.rlim_max = mem.rlim_cur;
 
@@ -272,25 +329,40 @@ void spawn_vm_child(VM *vm, const char *reservation_id, double cpu_percentage) {
 
 	if (setrlimit(RLIMIT_AS, &mem) == -1) {
 		perror("setrlimit mem");
-		_exit(1); //sem limit de memoria nao arranca a vm
+		_exit(1); //without the memory limit the vm doesn't start
 	}
 	if (setrlimit(RLIMIT_FSIZE, &disk) == -1) {
 		perror("setrlimit disk");
-		_exit(1); //sem limit de tamanho de ficheiro nao arranca a vm
+		_exit(1); //without the file size limit the vm doesn't start
 	}
 
-	//o cpulimit -l só aceita inteiros: truncar (8.33 -> 8) e no minimo 1 (VMs muito pequenas davam 0)
-	int cpu_limit = (int)cpu_percentage;
-	if (cpu_limit < 1) {
-		cpu_limit = 1;
+	//the app's working directory becomes its own vm folder (/tmp/CloudIST-114255/<reservation>/<vm>),
+	//so it finds its input files with relative paths
+	if (chdir(vm_dir) != 0) {
+		perror("chdir to the vm folder");
+		_exit(1);
 	}
-	//o exec só recebe strings, por isso converte-se o numero para texto
+
+	//the app's normal output (stdout) goes to /dev/null, so it doesn't mix with CloudIST's output;
+	//dup2 makes fd 1 (stdout) point to /dev/null. stderr stays, so the app's errors are still visible
+	int null_fd = open("/dev/null", O_WRONLY);
+	if (null_fd < 0) {
+		perror("open /dev/null");
+		_exit(1);
+	}
+	if (dup2(null_fd, STDOUT_FILENO) < 0) {
+		perror("dup2 stdout");
+		_exit(1);
+	}
+	close(null_fd);
+
+	//exec only takes strings, so the number is converted to text
 	char cpu_limit_str[32];
-	snprintf(cpu_limit_str, sizeof(cpu_limit_str), "%d", cpu_limit);
+	snprintf(cpu_limit_str, sizeof(cpu_limit_str), "%ld", cpu_limit);
 
-	//corre o exec_path do vm através do cpulimit (enunciado: cpulimit -q -f -l <CPULIMIT> -- <EXEC_PATH>)
-	//execlp com p porque procura o cpulimit no PATH; a app vai depois do --
-	execlp("cpulimit", "cpulimit", "-q", "-f", "-l", cpu_limit_str, "--", vm->type->exec_path, (char *)NULL);
+	//run the vm's exec_path through cpulimit (statement: cpulimit -q -f -l <CPULIMIT> -- <EXEC_PATH>)
+	//execlp with p because it looks for cpulimit in the PATH; the app goes after the --
+	execlp("cpulimit", "cpulimit", "-q", "-f", "-l", cpu_limit_str, "--", exec_path, (char *)NULL);
 	perror("exec cpulimit");
 	_exit(1);
 
@@ -299,29 +371,30 @@ void spawn_vm_child(VM *vm, const char *reservation_id, double cpu_percentage) {
 int spawn_all_vms(DataCenter *dc, Reservation *res) {
 	pid_t child_pid;
 
-	//loop por cada vm da reserva e cria um child process para cada uma
+	//loop through every vm of the reservation and create a child process for each one
 	for (size_t i = 0; i < res->num_vms; i++) {
 		VM *vm = res->vms[i];
 
-		//% de cpu para o cpulimit de cada processo child
-		//100 * vCPUs da vm * cores locais / (CPUs por servidor * nº de servidores)
-		double cpu_percentage = 100.0 * vm->type->required.cpu * (double)dc->local_cores
-		                        / (vm->server->total.cpu * (double)dc->num_servers);
+		long cpu_limit = vm_cpu_limit(dc, vm);
 
-		fflush(stdout);//não é necessário agora, mas básicamente garante que o que está no buffer de stdout é escrito antes de criar o child process, porque o child process herda o buffer do pai e se não se fizer flush, o que estava no buffer do pai vai ser escrito pelo child process também, duplicando a escrita
-		//fork: -1 erro, 0 child, default >= parent process (pid do child),
+		fflush(stdout);//makes sure what is in the stdout buffer is written before creating the child process: the child inherits the parent's buffer, and without the flush it would write it again (duplicated output)
+		//fork: -1 error, 0 child, default parent process (with the child's pid)
 		switch(child_pid = fork()){
 			case -1:
 				perror("fork error");
 				return 1;
-			//child process, chama a função para executar a vm
+			//child process: call the function that runs the vm
 			case 0:
-				spawn_vm_child(vm, res->id, cpu_percentage);
-				_exit(1); //usar o _exit em vez de exit porque o exit limpa tudo e flushes buffers  enquanto o _exit apenas sai do processo sem limpar, que é o que queres de um child process
-			//só o pai é que continua a correr o loop para criar outras children
+				spawn_vm_child(vm, res->id, cpu_limit);
+				_exit(1); //_exit instead of exit: exit cleans everything up and flushes the buffers, _exit just leaves the process, which is what you want in a child process
+			//only the parent keeps running the loop to create the other children
 			default:
 				vm->pid = child_pid;
 				vm->state = VM_STATE_RUNNING;
+				//one more vm process: wake the reaper up if it was waiting for vms
+				//(we are holding the reservations lock, from datacenter_execute)
+				dc->live_vms++;
+				pthread_cond_signal(&dc->vms_cond);
 				break;
 		}
 
@@ -357,8 +430,12 @@ const char *res_state_to_string(ReservationState state) {
 }
 
 /**
- * Marca em used[] (com 1) os servidores usados pelos items da reserva.
- * Ids de servidor inválidos são ignorados (o reservation_validate rejeita-os depois).
+ * Marks in used[] (with 1) the servers used by the reservation's items.
+ * Invalid server ids are ignored (reservation_validate rejects them).
+ *
+ * @param dc Pointer to the Data Center.
+ * @param res Reservation whose servers are marked.
+ * @param used Array with dc->num_servers positions.
  */
 static void mark_reservation_servers(DataCenter *dc, Reservation *res, char *used) {
 	memset(used, 0, dc->num_servers);
@@ -373,7 +450,7 @@ static void mark_reservation_servers(DataCenter *dc, Reservation *res, char *use
 void lock_reservation_servers(DataCenter *dc, Reservation *res) {
 	char used[dc->num_servers];
 	mark_reservation_servers(dc, res, used);
-	//o for vai do servidor 1 para cima -> tranca sempre por ordem crescente de id (evita deadlock)
+	//the for goes from server 1 upwards -> always locks in increasing id order (avoids deadlocks)
 	for (size_t i = 0; i < dc->num_servers; i++) {
 		if (used[i]) {
 			pthread_mutex_lock(&dc->servers[i].server_lock);
@@ -392,11 +469,11 @@ void unlock_reservation_servers(DataCenter *dc, Reservation *res) {
 }
 
 void destroy_vm_by_pid(DataCenter *dc, pid_t pid) {
-	//lock das reservas: vamos procurar no array e talvez apagar uma reserva (memmove)
-	//(também garante que o spawn já guardou o pid desta vm: o spawn tem este lock durante o fork)
+	//reservations lock: we search the list and may delete a reservation (memmove)
+	//(it also guarantees the spawn already stored this vm's pid: the spawn holds this lock during the fork)
 	pthread_mutex_lock(&dc->reservations_lock);
 
-	//procurar por todas as reservas a vm que tem este pid(podem estar várias a correr em pararelo)
+	//look through every reservation for the vm with this pid (several can be running in parallel)
 	for (size_t i = 0; i < dc->num_reservations; i++) {
 		Reservation *res = &dc->reservations[i];
 
@@ -408,18 +485,18 @@ void destroy_vm_by_pid(DataCenter *dc, pid_t pid) {
 
 			Server *server = vm->server;
 
-			//lock do servidor desta vm (ordem: reservas -> servidor)
+			//lock of this vm's server (order: reservations -> server)
 			pthread_mutex_lock(&server->server_lock);
 
-			//igual a reservation_destroy básicamente aqueles recursos que foram removidos pelo resources_sub no  reservation_commit, após o comando R(reserve), são devolvidos ao server
+			//same as reservation_destroy: the resources removed by resources_sub in reservation_commit (R command) go back to the server
 			resources_add(&server->available, vm->type->required);
 
-			//tirar a vm da lista do servidor (igual ao reservation_destroy)
+			//remove the vm from the server's list (same as reservation_destroy)
 			for (size_t j = 0; j < server->num_hosted_vms; j++) {
 				if (server->hosted_vms[j] == vm) {
-					/*igual ao reservation_destroy, com é uma lista ligada puxar as seguintes vms uma posição para trás, 
-					a partir da vm que se quer retirar
-					*memmove(destino, origem, numero de elementos depois da posição j*tamanho_do_elemento)*/
+					/*same as reservation_destroy: it's an array, so pull the following vms one position back,
+					starting at the vm we want to remove
+					*memmove(destination, source, number of elements after position j * element size)*/
 					memmove(&server->hosted_vms[j],
 									&server->hosted_vms[j + 1],
 									(server->num_hosted_vms - j - 1) * sizeof(VM *));
@@ -430,7 +507,13 @@ void destroy_vm_by_pid(DataCenter *dc, pid_t pid) {
 
 			pthread_mutex_unlock(&server->server_lock);
 
-			//tirar a vm da lista da reserva (puxar as seguintes uma posição para trás)
+			//resources were given back: wake up any R waiting for free resources
+			notify_resources_freed(dc);
+
+			//the vm ended: delete its folder (/tmp/CloudIST-114255/<reservation>/<vm>) with everything inside
+			remove_vm_folder(res->id, vm->id);
+
+			//remove the vm from the reservation's list (pull the following ones one position back)
 			memmove(&res->vms[k],
 							&res->vms[k + 1],
 							(res->num_vms - k - 1) * sizeof(VM *));
@@ -438,13 +521,19 @@ void destroy_vm_by_pid(DataCenter *dc, pid_t pid) {
 
 			free(vm);
 
-			//se era a ultima vm da reserva, apaga a reserva
-			//(com 0 vms o reservation_destroy só tira a reserva do array do dc)
+			//if it was the last vm of the reservation, delete the reservation and its (now empty) folder
+			//(with 0 vms reservation_destroy only removes the reservation from the dc list)
 			if (res->num_vms == 0) {
+				char reservation_id[MAX_STRING_SIZE];
+				//copy the id first: after reservation_destroy, res points to another reservation
+				strncpy(reservation_id, res->id, MAX_STRING_SIZE);
+				reservation_id[MAX_STRING_SIZE - 1] = '\0';
+
 				reservation_destroy(dc, res);
+				remove_reservation_folder(reservation_id);
 			}
 
-			//já encontrámos a vm, depois do reservation_destroy o ponteiro res já não é valido
+			//we found the vm; after reservation_destroy the res pointer is no longer valid
 			pthread_mutex_unlock(&dc->reservations_lock);
 			return;
 		}

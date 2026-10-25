@@ -40,7 +40,7 @@ typedef struct Server {
 	VM *hosted_vms[MAX_HOSTED_VMS];
     size_t num_hosted_vms;
 
-    pthread_mutex_t server_lock; // o lock para proteger cada servidor individualmente
+    pthread_mutex_t server_lock; // Protects only this server (available, hosted_vms), so reservations on different servers run in parallel.
 } Server;
 
 typedef enum {
@@ -50,7 +50,7 @@ typedef enum {
 } ReservationState;
 
 typedef struct ReservationPair {
-    char vm_type_id[MAX_STRING_SIZE]; // VM type. e.g: "V1"       
+    char vm_type_id[MAX_STRING_SIZE]; // VM type. e.g: "V1"
     size_t amount;                    // Amount of VMs with the given type being reserved.
     size_t server_id;                 // Server where each VM will be running on.
 
@@ -60,7 +60,7 @@ typedef struct ReservationPair {
 typedef struct Reservation {
 	char id[MAX_STRING_SIZE];                       // id of reservation.
 
-	ReservationItem items[MAX_RESERVATIONS_ITEMS];  // List of reservations items 
+	ReservationItem items[MAX_RESERVATIONS_ITEMS];  // List of reservations items
     size_t items_count;
 
 	VM *vms[MAX_RESERVATION_VMS];                   // List of VMs in this reservation.
@@ -68,32 +68,50 @@ typedef struct Reservation {
 	ReservationState state;                         // State of the reservation.
 } Reservation;
 
+/*
+ * Lock order (always the same, so there are no deadlocks):
+ *   vm_types_lock -> reservations_lock -> server_lock (increasing server id) -> resources_lock
+ */
 typedef struct DataCenter {
 	Server *servers;			     // List of Servers.
 	size_t num_servers;              // Number of Servers.
 
 	VMType vm_types[MAX_VM_TYPES];
     size_t num_vm_types;
-    pthread_rwlock_t vm_types_lock; // o lock para proteger o acesso à lista
+    pthread_rwlock_t vm_types_lock; // Protects the VM types list (D writes, R and L only read).
 
 	Reservation reservations[MAX_RESERVATIONS];
     size_t num_reservations;
-    pthread_mutex_t reservations_lock; // o lock para proteger o acesso à lista
+    pthread_mutex_t reservations_lock; // Protects the reservations list (and each VM's pid/state), live_vms and reaper_running.
 
 	int configured;		      // Wheter the datacenter is configured or not.
 
 	size_t local_cores;       // Cores of the local machine given to CloudIST (for the cpulimit %).
+
+	// VM reaper thread: destroys each VM as soon as its process ends (see datacenter_start_reaper).
+	pthread_t reaper_tid;
+	int reaper_started;       // 1 after datacenter_start_reaper (so datacenter_destroy knows it has to stop it).
+	int reaper_running;       // 0 = the program is ending: the reaper leaves when there are no VMs left.
+	size_t live_vms;          // VM processes started and not reaped yet.
+	pthread_cond_t vms_cond;  // Wakes the reaper up when a VM is started or when the program is ending.
+
+	// Waiting reservations: an R that doesn't fit right now waits here until some VM gives its resources back.
+	pthread_mutex_t resources_lock;
+	pthread_cond_t resources_cond;
+	unsigned long resources_version; // Incremented every time resources are given back to a server.
 } DataCenter;
 
 /**
- * Initializes a Data Center.
+ * Initializes a Data Center (empty lists and all the locks).
  *
  * @param dc DataCenter being initialized.
  */
 void datacenter_init(DataCenter *dc);
 
 /**
- * Destroys a Data Center.
+ * Destroys a Data Center: stops the VM reaper (if it was started), which
+ * first waits for every running VM to finish, and then frees the servers,
+ * the remaining VMs and the locks.
  *
  * @param dc DatacCenter being destroyed.
  */
@@ -111,11 +129,23 @@ void datacenter_destroy(DataCenter *dc);
 int datacenter_configure(DataCenter *dc, size_t num_pcs, Resources *resources);
 
 /**
+ * Starts the VM reaper thread. It blocks in waitpid() and destroys each VM
+ * (giving its resources back and deleting its folder) as soon as its process
+ * ends. It is not one of the MAX_THREADS worker threads.
+ *
+ * @param dc Pointer to a configured Data Center.
+ *
+ * @return 0 on success.
+ * @return 1 on error.
+ */
+int datacenter_start_reaper(DataCenter *dc);
+
+/**
  * Defines a VM for the Data Center
  *
  * @param dc Pointer to a Data Center.
  * @param type Pointer to VM type.
- * 
+ *
  * @return 0 on success.
  * @return 1 on error.
  */
@@ -124,9 +154,13 @@ int datacenter_define_VM(DataCenter *dc, struct VMType *type);
 /**
  * Reserves a set of VMs for a given reservation.
  *
+ * If the reservation fits in the servers (total resources) but there are not
+ * enough free resources right now, it waits until running VMs give resources
+ * back and tries again. If it can never fit, it fails right away.
+ *
  * @param dc Pointer to a Data Center.
  * @param reservation Pointer to a Reservation.
- * 
+ *
  * @return 0 on success.
  * @return 1 on error.
  */
@@ -136,18 +170,19 @@ int datacenter_reserve(DataCenter *dc, Reservation *reservation);
  * Lists the current state of the Data Center.
  *
  * @param dc Pointer to a Data Center.
- * 
+ *
  * @return 0 on success.
  * @return 1 on error.
  */
 int datacenter_list(DataCenter *dc);
 
 /**
- * Executes a reservation, launching the VMs.
+ * Executes a reservation, launching the VMs. It does not wait for them:
+ * each VM is destroyed by the reaper thread when its process ends.
  *
  * @param dc Pointer to a Data Center.
  * @param reservation_id ID of the reservation to execute.
- * 
+ *
  * @return 0 on success.
  * @return 1 on error.
  */
@@ -155,20 +190,20 @@ int datacenter_execute(DataCenter *dc, const char *reservation_id);
 
 /**
  * Executes a delay command.
- * 
+ *
  * @param delay_ms Delay in ms.
  */
 void datacenter_wait(unsigned int delay_ms);
 
 /**
- * Collects VM processes that have finished (waitpid) and destroys each
- * corresponding VM (see destroy_vm_by_pid). With block = 0 it only collects
- * the ones that already finished and returns right away; with block = 1 it
- * waits until there are no more VM processes.
+ * Thread-safe printf: prints to stdout while holding the print lock and
+ * flushes stdout before returning, so lines printed by different threads
+ * never get mixed (datacenter_list() holds the same lock while printing).
  *
- * @param dc Pointer to the Data Center.
- * @param block 0 = don't wait (WNOHANG), 1 = wait for all.
+ * Must not be called by a child process after fork().
+ *
+ * @param format printf-style format string.
  */
-void datacenter_collect_finished_vms(DataCenter *dc, int block);
+void datacenter_printf(const char *format, ...) __attribute__((format(printf, 1, 2)));
 
 #endif // DATACENTER__H

@@ -8,3 +8,8 @@
 #define MAX_RESERVATIONS       256
 #define MAX_RESERVATIONS_ITEMS 32
 #define MAX_RESERVATION_VMS    128
+// Root folder of every VM folder: CLOUDIST_ROOT/<reservation>/<vm>.
+// It has the student number in it: on a shared machine (the cluster) /tmp is
+// common to every user, and a /tmp/CloudIST created by another user would give
+// "Permission denied" (teacher's FAQ).
+#define CLOUDIST_ROOT "/tmp/CloudIST-114255"
