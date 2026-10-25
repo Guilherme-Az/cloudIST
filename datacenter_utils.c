@@ -118,10 +118,19 @@ void reservation_rollback(Reservation *reservation, size_t initial_vms){
 		// Restore resources
 		resources_add(&server->available, vm->type->required);
 
-		// Remove VM from server hosted list
-		server->num_hosted_vms--;
-
-		server->hosted_vms[server->num_hosted_vms] = NULL;
+		// Remove VM from server hosted list.
+		// Procura a vm em vez de assumir que é a última: com threads, entre o commit e o
+		// rollback (fase 3 do datacenter_reserve) outra reserva pode ter acrescentado vms a este servidor
+		for (size_t j = 0; j < server->num_hosted_vms; j++) {
+			if (server->hosted_vms[j] == vm) {
+				memmove(&server->hosted_vms[j],
+								&server->hosted_vms[j + 1],
+								(server->num_hosted_vms - j - 1) * sizeof(VM *));
+				server->num_hosted_vms--;
+				server->hosted_vms[server->num_hosted_vms] = NULL;
+				break;
+			}
+		}
 
 		// Remove VM from reservation
 		reservation->num_vms--;
