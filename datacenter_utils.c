@@ -25,7 +25,7 @@ VMType *VMType_exists(DataCenter *dc, const char* type_id){
  * @return 1 if the reservation exists.
  * @return 0 if the reservation does not exist.
  */	
-static int reservation_exists(DataCenter *dc, const char* reservation_id){
+int reservation_exists(DataCenter *dc, const char* reservation_id){
 	for(size_t i = 0; i < dc->num_reservations; i++){
 		if(strncmp(reservation_id, dc->reservations[i].id, MAX_STRING_SIZE) == 0){
 			return 1;
@@ -35,19 +35,22 @@ static int reservation_exists(DataCenter *dc, const char* reservation_id){
 }
 
 int reservation_validate(DataCenter *dc, Reservation *reservation) {
-	if(reservation_exists(dc, reservation->id)){
-		fprintf(stderr, "Reservation with id %s already exists.\n", reservation->id);
-		return 1;
-	}
+	//(a verificação do id repetido passou para o datacenter_reserve, porque lê o array
+	//das reservas e precisa do lock das reservas, que não se tranca aqui)
 
 	Resources available[dc->num_servers];
 	size_t hosted_count[dc->num_servers];
 	size_t vms_count = 0;
 
-	/* Copy current server resources and hosted_vms so we can simulate the allocation. */
-	for (size_t i = 0; i < dc->num_servers; i++) {
-		available[i] = dc->servers[i].available;
-		hosted_count[i] = dc->servers[i].num_hosted_vms;
+	/* Copy current server resources and hosted_vms so we can simulate the allocation.
+	 * Só dos servidores usados pela reserva: são os únicos trancados (lock_reservation_servers),
+	 * ler os outros seria uma data race (e o valor nem é usado). */
+	for (size_t i = 0; i < reservation->items_count; i++) {
+		size_t id = reservation->items[i].server_id;
+		if (id >= 1 && id <= dc->num_servers) {
+			available[id - 1] = dc->servers[id - 1].available;
+			hosted_count[id - 1] = dc->servers[id - 1].num_hosted_vms;
+		}
 	}
 
 	for (size_t i = 0; i < reservation->items_count; i++) {
@@ -106,7 +109,7 @@ int reservation_validate(DataCenter *dc, Reservation *reservation) {
  * @param reservation Pointer to the reservation being rolled back.
  * @param initial_vms Number of VMs that existed before the operation.
  */
-static void reservation_rollback(Reservation *reservation, size_t initial_vms){
+void reservation_rollback(Reservation *reservation, size_t initial_vms){
 	while (reservation->num_vms > initial_vms) {
 		VM *vm = reservation->vms[reservation->num_vms - 1];
 
@@ -344,8 +347,47 @@ const char *res_state_to_string(ReservationState state) {
     }
 }
 
+/**
+ * Marca em used[] (com 1) os servidores usados pelos items da reserva.
+ * Ids de servidor inválidos são ignorados (o reservation_validate rejeita-os depois).
+ */
+static void mark_reservation_servers(DataCenter *dc, Reservation *res, char *used) {
+	memset(used, 0, dc->num_servers);
+	for (size_t i = 0; i < res->items_count; i++) {
+		size_t id = res->items[i].server_id;
+		if (id >= 1 && id <= dc->num_servers) {
+			used[id - 1] = 1;
+		}
+	}
+}
+
+void lock_reservation_servers(DataCenter *dc, Reservation *res) {
+	char used[dc->num_servers];
+	mark_reservation_servers(dc, res, used);
+	//o for vai do servidor 1 para cima -> tranca sempre por ordem crescente de id (evita deadlock)
+	for (size_t i = 0; i < dc->num_servers; i++) {
+		if (used[i]) {
+			pthread_mutex_lock(&dc->servers[i].server_lock);
+		}
+	}
+}
+
+void unlock_reservation_servers(DataCenter *dc, Reservation *res) {
+	char used[dc->num_servers];
+	mark_reservation_servers(dc, res, used);
+	for (size_t i = dc->num_servers; i > 0; i--) {
+		if (used[i - 1]) {
+			pthread_mutex_unlock(&dc->servers[i - 1].server_lock);
+		}
+	}
+}
+
 void destroy_vm_by_pid(DataCenter *dc, pid_t pid) {
-	//procurar em todas as reservas a vm que tem este pid, pq pode haver várias reservas a correr em paralelo
+	//lock das reservas: vamos procurar no array e talvez apagar uma reserva (memmove)
+	//(também garante que o spawn já guardou o pid desta vm: o spawn tem este lock durante o fork)
+	pthread_mutex_lock(&dc->reservations_lock);
+
+	//procurar por todas as reservas a vm que tem este pid(podem estar várias a correr em pararelo)
 	for (size_t i = 0; i < dc->num_reservations; i++) {
 		Reservation *res = &dc->reservations[i];
 
@@ -356,6 +398,9 @@ void destroy_vm_by_pid(DataCenter *dc, pid_t pid) {
 			}
 
 			Server *server = vm->server;
+
+			//lock do servidor desta vm (ordem: reservas -> servidor)
+			pthread_mutex_lock(&server->server_lock);
 
 			//igual a reservation_destroy básicamente aqueles recursos que foram removidos pelo resources_sub no  reservation_commit, após o comando R(reserve), são devolvidos ao server
 			resources_add(&server->available, vm->type->required);
@@ -374,6 +419,8 @@ void destroy_vm_by_pid(DataCenter *dc, pid_t pid) {
 				}
 			}
 
+			pthread_mutex_unlock(&server->server_lock);
+
 			//tirar a vm da lista da reserva (puxar as seguintes uma posição para trás)
 			memmove(&res->vms[k],
 							&res->vms[k + 1],
@@ -389,7 +436,10 @@ void destroy_vm_by_pid(DataCenter *dc, pid_t pid) {
 			}
 
 			//já encontrámos a vm, depois do reservation_destroy o ponteiro res já não é valido
+			pthread_mutex_unlock(&dc->reservations_lock);
 			return;
 		}
 	}
+
+	pthread_mutex_unlock(&dc->reservations_lock);
 }

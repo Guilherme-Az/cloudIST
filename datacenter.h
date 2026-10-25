@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <sys/types.h>
+#include <pthread.h>
 
 #include "resources.h"
 #include "constants.h"
@@ -38,6 +39,8 @@ typedef struct Server {
 
 	VM *hosted_vms[MAX_HOSTED_VMS];
     size_t num_hosted_vms;
+
+    pthread_mutex_t server_lock; // o lock para proteger cada servidor individualmente
 } Server;
 
 typedef enum {
@@ -71,9 +74,11 @@ typedef struct DataCenter {
 
 	VMType vm_types[MAX_VM_TYPES];
     size_t num_vm_types;
+    pthread_rwlock_t vm_types_lock; // o lock para proteger o acesso à lista
 
 	Reservation reservations[MAX_RESERVATIONS];
     size_t num_reservations;
+    pthread_mutex_t reservations_lock; // o lock para proteger o acesso à lista
 
 	int configured;		      // Wheter the datacenter is configured or not.
 

@@ -72,6 +72,35 @@ Reservation *find_pending_reservation(DataCenter *dc, const char *reservation_id
 void reservation_destroy(DataCenter *dc, Reservation *reservation);
 
 /**
+ * Checks if a reservation with the given id already exists in the Data Center.
+ * Caller must hold dc->reservations_lock.
+ *
+ * @return 1 if the reservation exists, 0 otherwise.
+ */
+int reservation_exists(DataCenter *dc, const char* reservation_id);
+
+/**
+ * Rolls back the changes made by reservation_commit: frees the VMs created
+ * after the first initial_vms and gives their resources back to the servers.
+ * Caller must hold the locks of the reservation's servers.
+ *
+ * @param reservation Pointer to the reservation being rolled back.
+ * @param initial_vms Number of VMs that existed before the operation.
+ */
+void reservation_rollback(Reservation *reservation, size_t initial_vms);
+
+/**
+ * Locks the servers used by the reservation's items, always in increasing
+ * server id order (so two reservations can never deadlock).
+ */
+void lock_reservation_servers(DataCenter *dc, Reservation *res);
+
+/**
+ * Unlocks the servers locked by lock_reservation_servers.
+ */
+void unlock_reservation_servers(DataCenter *dc, Reservation *res);
+
+/**
  * Destroys the VM whose process has the given pid (called after waitpid()
  * reports that it finished): returns its resources to the hosting server,
  * removes it from the server and from its reservation, and frees it. If it

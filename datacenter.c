@@ -12,8 +12,10 @@ void datacenter_init(DataCenter *dc) {
   dc->num_servers = 0;
 
   dc->num_vm_types = 0;
+  pthread_rwlock_init(&dc->vm_types_lock, NULL);
 
   dc->num_reservations = 0;
+  pthread_mutex_init(&dc->reservations_lock, NULL);
 
   dc->configured = 0;
 
@@ -25,8 +27,12 @@ void datacenter_destroy(DataCenter *dc) {
     for(size_t j = 0; j < dc->servers[i].num_hosted_vms; j++){
       free(dc->servers[i].hosted_vms[j]);
     }
+    pthread_mutex_destroy(&dc->servers[i].server_lock);
+
   }
   free(dc->servers);
+  pthread_rwlock_destroy(&dc->vm_types_lock);
+  pthread_mutex_destroy(&dc->reservations_lock);
 }
 
 int datacenter_configure(DataCenter *dc, size_t num_servers, Resources *resources){
@@ -52,6 +58,7 @@ int datacenter_configure(DataCenter *dc, size_t num_servers, Resources *resource
     dc->servers[i].total = *resources;
     dc->servers[i].available = *resources;
     dc->servers[i].num_hosted_vms = 0;
+    pthread_mutex_init(&dc->servers[i].server_lock, NULL);
   }
 
   dc->num_servers = num_servers;
@@ -66,11 +73,7 @@ int datacenter_define_VM(DataCenter *dc, VMType *type){
     return 1;
   }
 
-  if(VMType_exists(dc, type->id) != NULL){
-    fprintf(stderr, "VM type with id %s already exists.\n", type->id);
-    return 1;
-  }
-
+  //estas verificações só olham para o disco, não para o dc, por isso ficam fora do lock
   if (!file_exists(type->exec_path)) {
     fprintf(stderr, "Invalid executable path.\n");
     return 1;
@@ -81,13 +84,25 @@ int datacenter_define_VM(DataCenter *dc, VMType *type){
     return 1;
   }
 
-  if(dc->num_vm_types >= MAX_VM_TYPES){
-    fprintf(stderr, "Maximum of VM types reached.\n");
+  //a partir daqui lê-se e escreve-se o array de tipos: lock de escrita (o D fica sozinho)
+  //atenção: cada return a partir daqui tem de fazer unlock antes
+  pthread_rwlock_wrlock(&dc->vm_types_lock);
+
+  if(VMType_exists(dc, type->id) != NULL){
+    fprintf(stderr, "VM type with id %s already exists.\n", type->id);
+    pthread_rwlock_unlock(&dc->vm_types_lock);
     return 1;
   }
-  
+
+  if(dc->num_vm_types >= MAX_VM_TYPES){
+    fprintf(stderr, "Maximum of VM types reached.\n");
+    pthread_rwlock_unlock(&dc->vm_types_lock);
+    return 1;
+  }
+
   dc->vm_types[dc->num_vm_types++] = *type;
 
+  pthread_rwlock_unlock(&dc->vm_types_lock);
   return 0;
 }
 
@@ -97,20 +112,46 @@ int datacenter_reserve(DataCenter *dc, Reservation *reservation) {
     return 1;
   }
 
-  if(reservation_validate(dc, reservation) != 0){
+  //fase 1+2: ver se cabe e tirar os recursos. Lock de leitura dos tipos (o validate procura os tipos)
+  //e lock só dos servidores desta reserva -> reservas em servidores diferentes correm em paralelo.
+  //validate e commit ficam dentro do mesmo lock, senão duas reservas viam "cabe" ao mesmo tempo
+  pthread_rwlock_rdlock(&dc->vm_types_lock);
+  lock_reservation_servers(dc, reservation);
+
+  int failed = reservation_validate(dc, reservation) != 0 || reservation_commit(dc, reservation) != 0;
+
+  unlock_reservation_servers(dc, reservation);
+  pthread_rwlock_unlock(&dc->vm_types_lock);
+
+  if (failed) {
     return 1;
   }
 
-  if (dc->num_reservations >= MAX_RESERVATIONS){
-    fprintf(stderr, "Max number of reservations reached\n");
-    return 1;
+  //fase 3: acrescentar ao array das reservas (lock das reservas)
+  pthread_mutex_lock(&dc->reservations_lock);
+
+  int duplicated = reservation_exists(dc, reservation->id);
+  int full = dc->num_reservations >= MAX_RESERVATIONS;
+
+  if (!duplicated && !full) {
+    dc->reservations[dc->num_reservations] = *reservation;
+    dc->num_reservations++;
   }
 
-  if (reservation_commit(dc, reservation) != 0)
-    return 1;
+  pthread_mutex_unlock(&dc->reservations_lock);
 
-  dc->reservations[dc->num_reservations] = *reservation;
-  dc->num_reservations++;
+  if (duplicated || full) {
+    if (duplicated) {
+      fprintf(stderr, "Reservation with id %s already exists.\n", reservation->id);
+    } else {
+      fprintf(stderr, "Max number of reservations reached\n");
+    }
+    //desfazer a fase 2: devolver os recursos e apagar as vms criadas (com os locks dos servidores)
+    lock_reservation_servers(dc, reservation);
+    reservation_rollback(reservation, 0);
+    unlock_reservation_servers(dc, reservation);
+    return 1;
+  }
 
   return 0;
 }
@@ -121,13 +162,25 @@ int datacenter_execute(DataCenter *dc, const char *reservation_id) {
     return 1;
   }
 
-  Reservation *res = find_pending_reservation(dc, reservation_id);
-  if (!res) return 1;
+  //lock das reservas desde o find até ao fim: o ponteiro res aponta para dentro do array,
+  //que pode mudar (memmove) se outra thread apagar uma reserva; e o spawn tem de guardar
+  //os pids antes de alguém tentar destruir estas vms (destroy_vm_by_pid usa o mesmo lock)
+  pthread_mutex_lock(&dc->reservations_lock);
 
-  if (spawn_all_vms(dc, res) != 0) return 1;
+  Reservation *res = find_pending_reservation(dc, reservation_id);
+  if (!res) {
+    pthread_mutex_unlock(&dc->reservations_lock);
+    return 1;
+  }
+
+  if (spawn_all_vms(dc, res) != 0) {
+    pthread_mutex_unlock(&dc->reservations_lock);
+    return 1;
+  }
 
   res->state = RES_STATE_RUNNING;
 
+  pthread_mutex_unlock(&dc->reservations_lock);
   return 0;
 }
 
@@ -135,6 +188,13 @@ int datacenter_list(DataCenter *dc) {
   if (!dc->configured) {
     fprintf(stderr, "Data Center needs to be configured!\n");
     return 1;
+  }
+
+  //o L lê tudo: tranca tudo, pela ordem tipos -> reservas -> servidores (1, 2, 3...)
+  pthread_rwlock_rdlock(&dc->vm_types_lock);
+  pthread_mutex_lock(&dc->reservations_lock);
+  for (size_t i = 0; i < dc->num_servers; i++) {
+    pthread_mutex_lock(&dc->servers[i].server_lock);
   }
 
   printf("=================================== DATA CENTER STATUS ===================================\n");
@@ -226,6 +286,13 @@ int datacenter_list(DataCenter *dc) {
   }
 
   printf("================================================================--------------------------\n\n");
+
+  //destrancar pela ordem inversa
+  for (size_t i = dc->num_servers; i > 0; i--) {
+    pthread_mutex_unlock(&dc->servers[i - 1].server_lock);
+  }
+  pthread_mutex_unlock(&dc->reservations_lock);
+  pthread_rwlock_unlock(&dc->vm_types_lock);
   return 0;
 }
 
